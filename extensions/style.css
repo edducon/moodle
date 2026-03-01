@@ -1,0 +1,91 @@
+#moodle-bot-btn {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    width: 60px;
+    height: 60px;
+    background-color: #007bff;
+    color: white;
+    border-radius: 50%;
+    text-align: center;
+    line-height: 60px;
+    font-size: 24px;
+    cursor: pointer;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+    z-index: 999999;
+    transition: transform 0.2s;
+}
+#moodle-bot-btn:hover {
+    transform: scale(1.1);
+}
+
+#moodle-bot-chat {
+    position: fixed;
+    bottom: 90px;
+    right: 20px;
+    width: 350px;
+    height: 500px;
+    background-color: white;
+    border-radius: 10px;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+    z-index: 999999;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    font-family: Arial, sans-serif;
+}
+
+#moodle-bot-chat-header {
+    background-color: #007bff;
+    color: white;
+    padding: 15px;
+    font-weight: bold;
+    text-align: center;
+}
+
+#moodle-bot-chat-messages {
+    flex-grow: 1;
+    padding: 15px;
+    overflow-y: auto;
+    background-color: #f8f9fa;
+}
+
+#moodle-bot-chat-input-area {
+    display: flex;
+    padding: 10px;
+    border-top: 1px solid #ddd;
+    background: white;
+}
+
+#moodle-bot-chat-input {
+    flex-grow: 1;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    outline: none;
+}
+
+#moodle-bot-chat-send {
+    background-color: #007bff;
+    color: white;
+    border: none;
+    padding: 0 15px;
+    margin-left: 10px;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.bot-msg { background: #e2e3e5; padding: 8px 12px; border-radius: 15px; margin-bottom: 10px; align-self: flex-start; max-width: 80%; width: fit-content; }
+.user-msg { background: #007bff; color: white; padding: 8px 12px; border-radius: 15px; margin-bottom: 10px; align-self: flex-end; max-width: 80%; width: fit-content; margin-left: auto;}
+
+@keyframes botPulse {
+    0% { box-shadow: 0 0 0 0 rgba(0, 123, 255, 0.7); background-color: transparent; }
+    50% { box-shadow: 0 0 0 15px rgba(0, 123, 255, 0); background-color: #e2eef9; }
+    100% { box-shadow: 0 0 0 0 rgba(0, 123, 255, 0); background-color: transparent; }
+}
+
+.bot-highlight-animation {
+    animation: botPulse 1.5s infinite;
+    border-radius: 8px;
+    border: 2px solid #007bff !important;
+}

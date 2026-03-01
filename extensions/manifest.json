@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Moodle Smart Assistant",
+  "version": "0.1",
+  "description": "Умный помощник для навигации по курсам Moodle",
+  "content_scripts": [
+    {
+      "matches": ["*://online.mospolytech.ru/*"],
+      "css": ["style.css"],
+      "js": ["content.js"]
+    }
+  ]
+}
