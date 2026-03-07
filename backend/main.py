@@ -1,3 +1,5 @@
+import copy
+
 from fastapi import FastAPI, Depends, Request, Response
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -73,7 +75,49 @@ def sync_course(data: CourseData, db: Session = Depends(get_db)):
     return {"status": "success", "message": f"Курс '{data.title}' сохранен/обновлен в БД!"}
 
 
-# ЭНДПОИНТ 2: Чат с ботом
+class ModuleUpdateData(BaseModel):
+    course_id: str
+    moodle_id: str
+    content_text: str
+    url: str
+
+
+# 2. Эндпоинт для сохранения текста лекции внутрь структуры курса
+@app.post("/api/module/update")
+def update_module_content(data: ModuleUpdateData, db: Session = Depends(get_db)):
+    # Ищем курс в БД
+    db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
+
+    if not db_course:
+        return {"status": "error", "message": "Курс не найден в БД. Сначала обновите оглавление."}
+
+    # В SQLAlchemy для обновления JSONB нужно сделать копию, изменить ее и сохранить обратно
+    sections = copy.deepcopy(db_course.content)
+    updated = False
+
+    # Ищем нужный модуль по всем секциям
+    for sec in sections:
+        for mod in sec.get("modules", []):
+            if mod.get("moodle_id") == data.moodle_id:
+                # Нашли! Записываем в него текст и ссылку
+                mod["content_text"] = data.content_text
+                mod["url"] = data.url
+                updated = True
+                break
+        if updated:
+            break
+
+    if updated:
+        db_course.content = sections
+        db_course.last_updated = datetime.now(timezone.utc)
+        db.commit()
+        print(f"✅ В БД обновлен контент для модуля: {data.moodle_id}")
+        return {"status": "success"}
+
+    return {"status": "ignored", "message": "Модуль не найден в оглавлении"}
+
+
+# ЭНДПОИНТ 3: Чат с ботом
 @app.post("/api/chat")
 def chat_with_bot(course_id: str, message: str, db: Session = Depends(get_db)):
     db_course = db.query(Course).filter(Course.course_id == course_id).first()
@@ -81,8 +125,15 @@ def chat_with_bot(course_id: str, message: str, db: Session = Depends(get_db)):
     if not db_course:
         return {"reply": "Курс еще не проиндексирован. Пожалуйста, откройте главную страницу курса.", "action": "none"}
 
+    # Вытаскиваем названия всех тем (секции)
+    sections = db_course.content
+    topic_titles = [sec.get("title", "Без названия") for sec in sections]
+
+    # Формируем красивый список с HTML-переносами строк
+    topics_list_html = "<br>".join([f"• {t}" for t in topic_titles])
+
     return {
-        "reply": f"Бот на связи! Вы спросили: '{message}'. В курсе {db_course.title} я насчитал {len(db_course.content)} тем.",
+        "reply": f"<b>Бот на связи!</b> Вы спросили: <i>'{message}'</i>.<br><br>Вот темы, которые я успешно сохранил в базу:<br>{topics_list_html}",
         "action": "none",
         "target_id": None
     }
