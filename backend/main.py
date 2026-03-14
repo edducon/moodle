@@ -67,7 +67,7 @@ class ModuleUpdateData(BaseModel):
 
 class SmartSearchRequest(BaseModel):
     course_id: str
-    message: str  # Сырой запрос от студента
+    message: str
 
 
 @app.get("/")

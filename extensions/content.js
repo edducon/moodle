@@ -84,6 +84,12 @@ function injectChatUI() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ course_id: courseId, message: text })
             });
+
+            if (!response.ok) {
+                console.error("Ошибка от сервера:", await response.text());
+                throw new Error(`Ошибка сервера: ${response.status}`);
+            }
+
             const data = await response.json();
 
             messagesArea.innerHTML += `<div class="bot-msg">${data.reply}</div>`;
@@ -92,7 +98,7 @@ function injectChatUI() {
             if (data.target_id) highlightElement(data.target_id);
 
         } catch (error) {
-            messagesArea.innerHTML += `<div class="bot-msg" style="color:red;">Ошибка соединения с сервером!</div>`;
+            messagesArea.innerHTML += `<div class="bot-msg" style="color:red;">Связь с сервером потеряна или запрос отклонен. Проверьте консоль!</div>`;
             messagesArea.scrollTop = messagesArea.scrollHeight;
         }
 
