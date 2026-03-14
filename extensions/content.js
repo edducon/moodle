@@ -5,8 +5,16 @@ function getCourseId() {
     return urlParams.get('id') || "unknown";
 }
 
+function highlightElement(targetId) {
+    const element = document.getElementById(targetId);
+    if (element) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        element.classList.add('bot-highlight-animation');
+        setTimeout(() => element.classList.remove('bot-highlight-animation'), 4000);
+    }
+}
+
 function injectChatUI() {
-    // 1. Создаем кнопку
     const btn = document.createElement('div');
     btn.id = 'moodle-bot-btn';
     btn.innerHTML = '🤖';
@@ -17,10 +25,10 @@ function injectChatUI() {
     chatWindow.innerHTML = `
         <div id="moodle-bot-chat-header">Moodle Assistant</div>
         <div id="moodle-bot-chat-messages">
-            <div class="bot-msg">Привет! Я проанализировал оглавление этого курса. Что ищем?</div>
+            <div class="bot-msg">Привет! Я цифровой наставник этого курса. Что ищем?</div>
         </div>
         <div id="moodle-bot-chat-input-area">
-            <input type="text" id="moodle-bot-chat-input" placeholder="Например: где лаба 3?">
+            <input type="text" id="moodle-bot-chat-input" placeholder="Введите ваш вопрос...">
             <button id="moodle-bot-chat-send">▶</button>
         </div>
     `;
@@ -37,8 +45,7 @@ function injectChatUI() {
         messagesArea.innerHTML += `
             <div class="bot-msg" style="border: 2px solid #ffc107; background: #fffdf5;">
                 <b>Режим преподавателя 🎓</b><br>
-                Курс обновился? Давайте соберем тексты всех лекций в базу бота!<br>
-                <button id="moodle-bot-spider-btn" class="btn btn-sm btn-warning mt-2" style="cursor:pointer; width:100%;">🕷️ Синхронизировать контент</button>
+                <button id="moodle-bot-spider-btn" class="btn btn-sm btn-warning mt-2" style="cursor:pointer; width:100%;">🕷️ Индексировать курс</button>
             </div>
         `;
 
@@ -61,7 +68,6 @@ function injectChatUI() {
         const text = inputField.value.trim();
         if (!text) return;
 
-        // Блокируем интерфейс
         isSending = true;
         sendBtn.style.opacity = "0.5";
         inputField.disabled = true;
@@ -73,8 +79,10 @@ function injectChatUI() {
         const courseId = getCourseId();
 
         try {
-            const response = await fetch(`http://127.0.0.1:8000/api/chat?course_id=${courseId}&message=${encodeURIComponent(text)}`, {
-                method: "POST"
+            const response = await fetch(`http://127.0.0.1:8000/api/smart-search`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ course_id: courseId, message: text })
             });
             const data = await response.json();
 
@@ -84,7 +92,7 @@ function injectChatUI() {
             if (data.target_id) highlightElement(data.target_id);
 
         } catch (error) {
-            messagesArea.innerHTML += `<div class="bot-msg" style="color:red;">Ошибка соединения с сервером! Проверьте бэкенд.</div>`;
+            messagesArea.innerHTML += `<div class="bot-msg" style="color:red;">Ошибка соединения с сервером!</div>`;
             messagesArea.scrollTop = messagesArea.scrollHeight;
         }
 
@@ -93,67 +101,22 @@ function injectChatUI() {
             sendBtn.style.opacity = "1";
             inputField.disabled = false;
             inputField.focus();
-        }, 1000);
+        }, 1500);
     };
 
     sendBtn.addEventListener('click', sendMessage);
     inputField.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });
 }
 
-async function runSpider(btnElement, messagesArea) {
-    btnElement.disabled = true;
-    btnElement.innerText = "⏳ Собираю ссылки...";
+function proactiveGreeting() {
+    const messagesArea = document.getElementById('moodle-bot-chat-messages');
+    if (!messagesArea) return;
+    const path = window.location.pathname;
 
-    const links = [];
-    document.querySelectorAll('li.activity.modtype_page a.aalink, li.activity.modtype_resource a.aalink, li.activity.modtype_assign a.aalink').forEach(a => links.push(a.href));
-
-    const total = links.length;
-    let current = 0;
-    const courseId = getCourseId();
-
-    messagesArea.innerHTML += `<div class="bot-msg">Найдено ссылок для парсинга: ${total}. Начинаю работу...</div>`;
-    messagesArea.scrollTop = messagesArea.scrollHeight;
-
-    for (const link of links) {
-        current++;
-        btnElement.innerText = `🕷️ ${current} из ${total}`;
-        try {
-            const response = await fetch(link);
-            const htmlText = await response.text();
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(htmlText, "text/html");
-            const main = doc.querySelector('[role="main"]');
-
-            if (main) {
-                const text = main.innerText.replace(/\s+/g, ' ').trim();
-                const urlObj = new URL(link);
-                const modId = `module-${urlObj.searchParams.get('id')}`;
-
-                await fetch("http://127.0.0.1:8000/api/module/update", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ course_id: courseId, moodle_id: modId, content_text: text, url: link })
-                });
-            }
-        } catch (err) {
-            console.error("Ошибка парсинга:", link);
-        }
-
-        await new Promise(r => setTimeout(r, 1000));
-    }
-
-    btnElement.innerText = "✅ База обновлена!";
-    btnElement.classList.replace('btn-warning', 'btn-success');
-    messagesArea.innerHTML += `<div class="bot-msg"><b>Готово!</b> Весь контент сохранен в базу.</div>`;
-    messagesArea.scrollTop = messagesArea.scrollHeight;
-}
-
-function highlightElement(targetId) {
-    const element = document.getElementById(targetId);
-    if (element) {
-        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        element.classList.add('bot-highlight-animation');
-        setTimeout(() => element.classList.remove('bot-highlight-animation'), 4000);
+    if (path.includes('/mod/assign/view.php')) {
+        messagesArea.innerHTML += `<div class="bot-msg" style="background: #e3f2fd; border-left: 4px solid #007bff;">🎓 Вижу, вы открыли практическое задание. Помните: чтобы успешно его сдать, нужно опираться на теорию. Напишите мне, если нужно найти соответствующую лекцию!</div>`;
+    } else if (path.includes('/mod/quiz/view.php')) {
+        messagesArea.innerHTML += `<div class="bot-msg" style="background: #fff3cd; border-left: 4px solid #ffc107;">⚠️ Впереди тестирование! Убедитесь, что повторили все материалы. Удачи!</div>`;
     }
 }
 
@@ -178,14 +141,7 @@ async function parseCourseIndex() {
                 if (hiddenSpan) hiddenSpan.remove();
                 title = clone.innerText.trim();
             }
-
-            let type = "unknown";
-            if (act.classList.contains('modtype_assign')) type = "assignment";
-            else if (act.classList.contains('modtype_quiz')) type = "quiz";
-            else if (act.classList.contains('modtype_resource')) type = "file";
-            else if (act.classList.contains('modtype_page')) type = "page";
-            else if (act.classList.contains('modtype_forum')) type = "forum";
-
+            let type = act.className.match(/modtype_(\w+)/) ? act.className.match(/modtype_(\w+)/)[1] : "unknown";
             sectionData.modules.push({ moodle_id: act.id, type: type, title: title, url: linkNode ? linkNode.href : null });
         });
         if (sectionData.modules.length > 0) courseData.sections.push(sectionData);
@@ -200,11 +156,72 @@ async function parseCourseIndex() {
     } catch (e) {}
 }
 
+async function passiveModuleSync() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const moduleIdRaw = urlParams.get('id');
+    if (!moduleIdRaw) return;
+
+    const fullModuleId = `module-${moduleIdRaw}`;
+    const mainContent = document.querySelector('[role="main"]');
+
+    if (mainContent) {
+        const textContent = mainContent.innerText.replace(/\s+/g, ' ').trim();
+        try {
+            await fetch("http://127.0.0.1:8000/api/module/update", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ course_id: getCourseId(), moodle_id: fullModuleId, content_text: textContent, url: window.location.href })
+            });
+        } catch (e) {}
+    }
+}
+
+async function runSpider(btnElement, messagesArea) {
+    btnElement.disabled = true;
+    btnElement.innerText = "⏳ Собираю ссылки...";
+
+    const links = [];
+    document.querySelectorAll('li.activity.modtype_page a.aalink, li.activity.modtype_resource a.aalink, li.activity.modtype_assign a.aalink, li.activity.modtype_book a.aalink').forEach(a => links.push(a.href));
+
+    const total = links.length;
+    const courseId = getCourseId();
+    messagesArea.innerHTML += `<div class="bot-msg">Найдено ссылок для парсинга: ${total}. Начинаю работу...</div>`;
+    messagesArea.scrollTop = messagesArea.scrollHeight;
+
+    for (let i = 0; i < total; i++) {
+        btnElement.innerText = `🕷️ ${i + 1} из ${total}`;
+        try {
+            const response = await fetch(links[i]);
+            const htmlText = await response.text();
+            const doc = new DOMParser().parseFromString(htmlText, "text/html");
+            const main = doc.querySelector('[role="main"]');
+
+            if (main) {
+                const urlObj = new URL(links[i]);
+                await fetch("http://127.0.0.1:8000/api/module/update", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ course_id: courseId, moodle_id: `module-${urlObj.searchParams.get('id')}`, content_text: main.innerText.replace(/\s+/g, ' ').trim(), url: links[i] })
+                });
+            }
+        } catch (err) {}
+        await new Promise(r => setTimeout(r, 1000));
+    }
+
+    btnElement.innerText = "✅ База обновлена!";
+    btnElement.classList.replace('btn-warning', 'btn-success');
+    messagesArea.innerHTML += `<div class="bot-msg"><b>Готово!</b> Весь контент сохранен в векторную базу.</div>`;
+    messagesArea.scrollTop = messagesArea.scrollHeight;
+}
+
 setTimeout(() => {
     injectChatUI();
-
     const path = window.location.pathname;
+
     if (path.includes('/course/view.php')) {
         parseCourseIndex();
+    } else if (path.includes('/mod/')) {
+        passiveModuleSync();
+        proactiveGreeting();
     }
-}, 1000);
+}, 1500);

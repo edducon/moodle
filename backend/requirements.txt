@@ -1,6 +1,11 @@
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-sqlalchemy>=2.0.30
-psycopg2-binary>=2.9.9
-pydantic>=2.7.0
-pydantic-settings>=2.2.0
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+pydantic
+pydantic-settings
+openai
+sentence-transformers
+scikit-learn
+numpy
+pgvector

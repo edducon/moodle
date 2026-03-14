@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  moodle_db:
+    image: pgvector/pgvector:pg16
+    container_name: moodle_vector_db
+    env_file:
+      - .env  # Читаем переменные из файла
+    environment:
+      # Подставляем их в настройки базы
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  moodle_backend:
+    build: .
+    container_name: moodle_fastapi
+    ports:
+      - "8000:8000"
+    depends_on:
+      - moodle_db
+    env_file:
+      - .env  # Читаем переменные для бэкенда
+    environment:
+      # Динамически собираем ссылку для SQLAlchemy внутри контейнера
+      DATABASE_URL: postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@moodle_db:5432/${DB_NAME}
+      # Спец-адрес Docker для доступа к Ollama на твоем ПК
+      OLLAMA_URL: http://host.docker.internal:11434/v1
+    restart: unless-stopped
+
+volumes:
+  pgdata:
