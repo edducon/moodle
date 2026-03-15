@@ -24,6 +24,8 @@ services:
       - "8000:8000"
     depends_on:
       - moodle_db
+    volumes:
+      - .:/app
     env_file:
       - .env  # Читаем переменные для бэкенда
     environment:

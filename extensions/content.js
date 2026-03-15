@@ -92,7 +92,13 @@ function injectChatUI() {
 
             const data = await response.json();
 
-            messagesArea.innerHTML += `<div class="bot-msg">${data.reply}</div>`;
+            // Превращаем переносы строк в теги <br>, а **текст** в жирный
+            const formattedReply = data.reply
+                .replace(/\n/g, '<br>')
+                .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+                .replace(/\* /g, '• '); // Заменяем звездочки списков на красивые точки
+
+            messagesArea.innerHTML += `<div class="bot-msg">${formattedReply}</div>`;
             messagesArea.scrollTop = messagesArea.scrollHeight;
 
             if (data.target_id) highlightElement(data.target_id);
@@ -152,6 +158,7 @@ async function parseCourseIndex() {
         });
         if (sectionData.modules.length > 0) courseData.sections.push(sectionData);
     });
+    checkFirstVisitAndGreet(courseData);
 
     try {
         await fetch("http://127.0.0.1:8000/api/course/sync", {
@@ -218,6 +225,55 @@ async function runSpider(btnElement, messagesArea) {
     btnElement.classList.replace('btn-warning', 'btn-success');
     messagesArea.innerHTML += `<div class="bot-msg"><b>Готово!</b> Весь контент сохранен в векторную базу.</div>`;
     messagesArea.scrollTop = messagesArea.scrollHeight;
+}
+
+function checkFirstVisitAndGreet(courseData) {
+    // Создаем уникальный ключ для этого курса
+    const visitedKey = `moodle_bot_visited_${courseData.course_id}`;
+
+    // Проверяем, заходил ли студент сюда ранее
+    if (!localStorage.getItem(visitedKey)) {
+
+        // Считаем количество заданий и тестов
+        let assignCount = 0;
+        let quizCount = 0;
+
+        courseData.sections.forEach(sec => {
+            sec.modules.forEach(mod => {
+                if (mod.type === 'assignment') assignCount++;
+                if (mod.type === 'quiz') quizCount++;
+            });
+        });
+
+        const chatWindow = document.getElementById('moodle-bot-chat');
+        const messagesArea = document.getElementById('moodle-bot-chat-messages');
+        const botBtn = document.getElementById('moodle-bot-btn');
+
+        if (chatWindow && messagesArea && botBtn) {
+            // Принудительно открываем чат
+            chatWindow.style.display = 'flex';
+
+            // Заставляем кнопку пульсировать для привлечения внимания
+            botBtn.classList.add('bot-highlight-animation');
+            setTimeout(() => botBtn.classList.remove('bot-highlight-animation'), 4000);
+
+            // Формируем и отправляем сообщение от бота
+            messagesArea.innerHTML += `
+                <div class="bot-msg" style="border: 2px solid #007bff; background: #e2eef9;">
+                    👋 <b>Добро пожаловать на курс!</b><br>
+                    Я проанализировал оглавление <i>"${courseData.title}"</i>.<br><br>
+                    В этом курсе тебя ждут:<br>
+                    📝 Заданий: <b>${assignCount}</b><br>
+                    ❓ Тестов: <b>${quizCount}</b><br><br>
+                    Пока я не нашел горящих дедлайнов. Я буду следить за обновлениями. Если нужно найти конкретную работу — просто напиши мне!
+                </div>
+            `;
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+
+            // Запоминаем, что мы уже поздоровались
+            localStorage.setItem(visitedKey, 'true');
+        }
+    }
 }
 
 setTimeout(() => {

@@ -151,19 +151,39 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     # Базовая логика болталки
     if any(w in user_message_lower for w in ["привет", "здравствуй", "хай", "добрый день"]):
         return {
-            "reply": "Здравствуйте! Я ваш цифровой наставник 🎓. Какой теоретический вопрос или материал курса вас интересует?",
+            "reply": "Здравствуйте! Я ваш цифровой наставник 🎓. Какой материал курса нужно помочь найти?",
             "target_id": None}
 
     # Защита от взлома промпта (Prompt Injection)
     stop_words = ["забудь", "игнорируй", "предыдущие инструкции", "напиши код", "реши за меня"]
     if any(word in user_message_lower for word in stop_words):
-        return {"reply": "Хорошая попытка! 😉 Но я здесь, чтобы направлять. Вернемся к изучению теории?",
+        return {"reply": "Хорошая попытка! 😉 Но я здесь, чтобы направлять. Вернемся к навигации?",
                 "target_id": None}
+
+    # === НОВОЕ: ДОСТАЕМ ОГЛАВЛЕНИЕ КУРСА ИЗ БАЗЫ ===
+    course = db.query(Course).filter(Course.course_id == data.course_id).first()
+    course_structure = "Оглавление курса:\n"
+    if course and course.content:
+        for sec in course.content:
+            course_structure += f"- {sec.get('title', 'Раздел')}:\n"
+            for mod in sec.get("modules", []):
+                # Переводим типы Moodle на понятный русский для ИИ
+                m_type = mod.get("type", "")
+                if m_type == "quiz":
+                    type_ru = "Тест"
+                elif m_type == "assign":
+                    type_ru = "Задание"
+                elif m_type == "page":
+                    type_ru = "Лекция"
+                else:
+                    type_ru = "Элемент"
+
+                course_structure += f"  * [{type_ru}] {mod.get('title', 'Без названия')}\n"
 
     # 1. Превращаем запрос студента в вектор
     query_vector = embedder.encode([data.message])[0].tolist()
 
-    # 2. Ищем самый близкий по смыслу текст прямо в PostgreSQL (магия pgvector!)
+    # 2. Ищем самый близкий по смыслу текст (если он есть)
     closest_module = db.query(ModuleIndex) \
         .filter(ModuleIndex.course_id == data.course_id) \
         .order_by(ModuleIndex.embedding.cosine_distance(query_vector)) \
@@ -174,47 +194,43 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     mod_title = ""
 
     if closest_module:
-        # Берем первые 2000 символов, чтобы не перегружать локальный ИИ
-        context_text = closest_module.content_text[:2000] if closest_module.content_text else ""
+        context_text = closest_module.content_text[:1500] if closest_module.content_text else ""
         target_id = closest_module.moodle_id
         mod_title = closest_module.title
-        print(f"🎯 Postgres нашел совпадение по векторам: {mod_title}")
 
-    # 3. Формируем промпт для локальной нейросети Qwen2.5
+    # 3. Формируем промпт для Llama 3.1
     system_prompt = """
-    Ты — цифровой ассистент Moodle, строгий, но справедливый преподаватель-наставник.
-    Твоя задача — помогать студенту с теорией, опираясь ТОЛЬКО на предоставленный контекст.
+    Ты — цифровой ассистент-навигатор по платформе Moodle.
+    Твоя цель — помогать студенту находить нужные материалы курса (задания, тесты, лекции), опираясь ТОЛЬКО на предоставленную структуру курса и тексты.
 
-    ЖЕСТКИЕ ПРАВИЛА:
-    1. НИКОГДА не пиши код за студента и не решай практические задачи.
-    2. Если в контексте есть нужная информация, дай краткую подсказку и направь студента читать материал.
-    3. Отвечай кратко, емко и по существу (максимум 3-4 предложения).
-    4. Общайся на русском языке.
+    ПРАВИЛА:
+    1. Ты НЕ объясняешь теорию и НЕ решаешь задачи. Твоя роль — дать направление.
+    2. Если студент спрашивает про тесты, задания или лекции, найди их в "Оглавлении курса" и перечисли названия.
+    3. Отвечай кратко, приветливо (максимум 2-4 предложения) и СТРОГО на русском языке.
     """
 
-    if target_id and context_text:
-        user_prompt = f"""
-        Я нашел материал «{mod_title}». Отрывок: {context_text}
-        Сообщение студента: \"\"\"{data.message}\"\"\"
-        Сформируй ответ. Скажи, что подсветил материал «{mod_title}» на экране.
-        """
-    else:
-        user_prompt = f"""
-        Сообщение студента: \"\"\"{data.message}\"\"\"
-        Материалы не найдены. Попроси уточнить запрос.
-        """
+    user_prompt = f"""
+    {course_structure}
+
+    Найденный отрывок текста по запросу (если есть):
+    Название: {mod_title}
+    Текст: {context_text}
+
+    Вопрос студента: \"\"\"{data.message}\"\"\"
+    Ответь студенту, опираясь на эти данные.
+    """
 
     # 4. Отправляем в Ollama
     try:
         response = client.chat.completions.create(
-            model="qwen2.5",
+            model="llama3.1",
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             temperature=0.3
         )
         ai_reply = response.choices[0].message.content
     except Exception as e:
         print(f"Ошибка при подключении к Ollama: {e}")
-        ai_reply = "Извините, нейромодуль (Ollama) сейчас недоступен. Проверьте, запущена ли она на вашем компьютере."
+        ai_reply = "Извините, нейромодуль (Ollama) сейчас недоступен. Проверьте, запущена ли она."
 
     return {"reply": ai_reply, "target_id": target_id}
 

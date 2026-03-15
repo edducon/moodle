@@ -5,7 +5,8 @@
   "description": "Умный помощник для навигации по курсам Moodle",
   "content_scripts": [
     {
-      "matches": ["*://online.mospolytech.ru/*"],
+      "matches": ["*://online.mospolytech.ru/*",
+                  "*://lms.mospolytech.ru/*"],
       "css": ["style.css"],
       "js": ["content.js"]
     }
