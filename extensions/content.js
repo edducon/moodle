@@ -5,6 +5,176 @@ function getCourseId() {
     return urlParams.get('id') || "unknown";
 }
 
+function parseRuDate(dateStr) {
+    if (!dateStr) return null;
+    const normalized = dateStr.trim().toLowerCase().replace(/\s+г\.?$/, '');
+    const cleanDate = normalized.replace(/\d{1,2}:\d{2}/, '').trim();
+    const patterns = [
+        {regex: /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/, handler: (matches) => {
+                const day = parseInt(matches[1]);
+                const month = parseInt(matches[2]) - 1;
+                const year = parseInt(matches[3]);
+                return new Date(year, month, day, 23, 59, 0);}
+        },
+        {regex: /^(\d{1,2})\s+([а-яё]+)\s+(\d{4})$/i, handler: (matches) => {
+                const monthMap = {
+                    'января': 0, 'февраля': 1, 'марта': 2, 'апреля': 3,
+                    'мая': 4, 'июня': 5, 'июля': 6, 'августа': 7,
+                    'сентября': 8, 'октября': 9, 'ноября': 10, 'декабря': 11};
+                const day = parseInt(matches[1]);
+                const month = monthMap[matches[2].toLowerCase()];
+                const year = parseInt(matches[3]);
+                if (month === undefined) return null;
+                return new Date(year, month, day, 23, 59, 0);}
+        }
+    ];
+    for (const pattern of patterns) {
+        const matches = cleanDate.match(pattern.regex);
+        if (matches) {
+            return pattern.handler(matches);
+        }
+    }
+    return null;
+}
+
+async function extractDeadlinesFromCourse() {
+    const deadlines = [];
+    const assignments = document.querySelectorAll('li.activity.modtype_assign a.aalink');
+    for (const a of assignments) {
+        const link = a.href;
+        const title = a.innerText.trim();
+        try {
+            const response = await fetch(link);
+            const htmlText = await response.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(htmlText, "text/html");
+            let submitted = false;
+            const statusEl = doc.querySelector('.submissionstatus, .submissionstatussubmitted, .badge-success');
+            if(statusEl && /выполнено|отправлено|submitted/i.test(statusEl.innerText)) {
+                submitted = true;
+            }
+            if(submitted) continue;
+            const dueTextMatch = doc.body.innerText.match(
+                /Срок сдачи:\s*(?:[а-яё]+,\s*)?(\d{1,2}\s+[а-яё]+ \d{4})(?:,\s*\d{2}:\d{2})?/i
+            );
+            if (dueTextMatch && dueTextMatch[1]) {
+                const dueDate = parseRuDate(dueTextMatch[1]);
+                if(dueDate){
+                    deadlines.push({
+                        title,
+                        due_date_raw: dueTextMatch[1],
+                        due_date: dueDate,
+                        url: link,
+                        moodle_id: a.closest('li.activity')?.id || null
+                    });
+                }
+            }
+        } catch (e) {
+            console.error("Ошибка:", link, e);
+        }
+    }
+    return deadlines;
+}
+
+function formatDateRu(date) {
+    if (!(date instanceof Date) || isNaN(date.getTime())) return '';
+    return date.toLocaleDateString('ru-RU');
+}
+
+function getDaysLeft(date) {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const target = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    return Math.ceil((target - today) / (1000*60*60*24));
+}
+
+function buildDeadlineLabel(date) {
+    const daysLeft = getDaysLeft(date);
+    if (daysLeft < 0) return 'Срок уже прошёл';
+    if (daysLeft === 0) return 'Сегодня дедлайн';
+    if (daysLeft === 1) return 'Завтра дедлайн';
+    if (daysLeft <= 3) return `Через ${daysLeft} дн. дедлайн`;
+    return 'Ближайшая работа';
+}
+
+function markNotificationClosedToday(storageKey) {
+    const today = new Date().toLocaleDateString('ru-RU');
+    localStorage.setItem(storageKey, today);
+}
+const minimizedDeadlines = [];
+function wasNotificationClosedToday(storageKey) {
+    const today = new Date().toLocaleDateString('ru-RU');
+    return localStorage.getItem(storageKey) === today;
+}
+function showDeadlineNotification(deadline) {
+    if (!deadline) return;
+    const storageKey = `moodle_deadline_closed_${getCourseId()}_${deadline.title}_${deadline.due_date_raw}`;
+    if (wasNotificationClosedToday(storageKey)) return;
+    const bubbleId = `moodle-deadline-bubble-${deadline.moodle_id || Math.random().toString(36).slice(2)}`;
+    const bubble = document.createElement('div');
+    bubble.id = bubbleId;
+    bubble.classList.add('moodle-deadline-bubble');
+
+    const badgeText = buildDeadlineLabel(deadline.due_date);
+    const prettyDate = formatDateRu(deadline.due_date);
+    bubble.innerHTML = `
+        <div class="moodle-deadline-badge">${badgeText}</div>
+         <div class="moodle-deadline-title"><span class="reminder">Напоминание</span></div>
+        <div class="moodle-deadline-text">
+            Прикрепите работу <b>${deadline.title}</b> до <b>${prettyDate}</b>
+        </div>
+        <div class="moodle-deadline-actions">
+            <button class="moodle-deadline-open">Открыть</button>
+            <button class="moodle-deadline-minimize" title="Свернуть">_</button>
+            <button class="moodle-deadline-close" title="Закрыть">×</button>
+        </div>
+    `;
+    const container = document.getElementById('moodle-deadlines-container');
+    container.appendChild(bubble);
+
+    bubble.querySelector('.moodle-deadline-open')?.addEventListener('click', () => {
+        if (deadline.moodle_id) {
+            const element = document.getElementById(deadline.moodle_id);
+            if (element) element.scrollIntoView({behavior:'smooth', block:'center'});
+        }
+        if (deadline.url) window.open(deadline.url, '_blank');
+    });
+
+    bubble.querySelector('.moodle-deadline-minimize')?.addEventListener('click', () => {
+        bubble.style.display = 'none';
+        minimizedDeadlines.push(deadline);
+        updateMinimizedChatButton();
+    });
+
+    bubble.querySelector('.moodle-deadline-close')?.addEventListener('click', () => {
+        markNotificationClosedToday(storageKey);
+        bubble.classList.add('moodle-deadline-close-animation');
+        setTimeout(() => bubble.remove(), 400);
+    });
+}
+
+function updateMinimizedChatButton() {
+    let chatBtn = document.getElementById('moodle-minimized-btn');
+    if (!chatBtn) {
+        chatBtn = document.createElement('button');
+        chatBtn.id = 'moodle-minimized-btn';
+
+        const video = document.createElement('video');
+        video.src = "https://cdn-icons-mp4.flaticon.com/512/11919/11919421.mp4";
+        video.autoplay = true;
+        video.loop = true;
+        video.muted = true;
+        video.playsInline = true;
+        chatBtn.appendChild(video);
+        document.body.appendChild(chatBtn);
+        chatBtn.addEventListener('click', () => {
+            minimizedDeadlines.forEach(dl => showDeadlineNotification(dl));
+            minimizedDeadlines.length = 0;
+            chatBtn.remove();
+        });
+    }
+}
+
 function highlightElement(targetId) {
     const element = document.getElementById(targetId);
     if (element) {
@@ -15,6 +185,12 @@ function highlightElement(targetId) {
 }
 
 function injectChatUI() {
+    if (!document.getElementById('moodle-deadlines-container')) {
+        const container = document.createElement('div');
+        container.id = 'moodle-deadlines-container';
+        document.body.appendChild(container);
+    }
+
     const btn = document.createElement('div');
     btn.id = 'moodle-bot-btn';
     btn.innerHTML = '🤖';
@@ -112,6 +288,18 @@ function injectChatUI() {
 
     sendBtn.addEventListener('click', sendMessage);
     inputField.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });
+    if (isMainPage) {
+        setTimeout(async () => {
+            const deadlines = await extractDeadlinesFromCourse();
+            const upcoming = deadlines
+                .filter(d => d.due_date instanceof Date && !isNaN(d.due_date.getTime()))
+                .filter(d => getDaysLeft(d.due_date) >= 0)
+                .sort((a,b) => a.due_date - b.due_date);
+            for (const d of upcoming) {
+                showDeadlineNotification(d);
+            }
+        }, 0);
+    }
 }
 
 function proactiveGreeting() {

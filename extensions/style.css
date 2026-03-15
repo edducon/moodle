@@ -89,3 +89,147 @@
     border-radius: 8px;
     border: 2px solid #007bff !important;
 }
+
+#moodle-deadlines-container {
+    position: fixed;
+    top: 120px;
+    right: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 9999;
+}
+
+.moodle-deadline-bubble {
+    background: rgba(151, 138, 165, 0.16);
+    backdrop-filter: blur(8px);
+    border: 1.5px solid #6f4dff;
+    border-radius: 16px;
+    padding: 12px;
+    min-width: 280px;
+    max-width: 320px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.1);
+    color: #fff;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-family: 'Inter', sans-serif;
+    transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+
+.moodle-deadline-bubble:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 22px rgba(0,0,0,0.18);
+}
+
+.moodle-deadline-badge {
+    background: #6f4dff;
+    color: #fff;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    align-self: flex-start;
+}
+
+.moodle-deadline-title {
+    font-weight: 600;
+    font-size: 15px;
+}
+
+.moodle-deadline-text {
+    font-size: 13px;
+    color: #0d0042;
+}
+
+.moodle-deadline-text b {
+    color: #180373;
+    font-weight: 600;
+}
+
+.moodle-deadline-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.moodle-deadline-open {
+    flex: 2;
+    background: #6f4dff;
+    color: #fff;
+    border: none;
+    padding: 8px 12px;
+    border-radius: 10px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 12px;
+    transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.moodle-deadline-open:hover {
+    background: #8360ff;
+    transform: translateY(-1px);
+}
+
+.moodle-deadline-minimize,
+.moodle-deadline-close {
+    flex: 1;
+    background: #f0f0f0;
+    color: #6f4dff;
+    border: 1.5px solid #6f4dff;
+    border-radius: 8px;
+    padding: 6px 8px;
+    cursor: pointer;
+    font-weight: 700;
+    font-size: 18px;
+    width: 45px;
+    height: 36px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    transition: all 0.2s ease;
+}
+
+.moodle-deadline-minimize:hover,
+.moodle-deadline-close:hover {
+    background: #e8e8e8;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+}
+
+.moodle-deadline-close-animation {
+    opacity: 0;
+    transform: scale(0.95);
+    transition: all 0.25s ease;
+}
+
+#moodle-minimized-btn {
+    position: fixed;
+    bottom: 100px;
+    right: 20px;
+    width: 55px;
+    height: 55px;
+    border-radius: 50%;
+    background: rgba(44,26,79,0.2);
+    backdrop-filter: blur(6px);
+    border: 1px solid rgba(111,77,255,0.3);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    cursor: pointer;
+    z-index: 9999;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    transition: all 0.25s ease;
+}
+
+#moodle-minimized-btn:hover {
+    transform: translateY(-2px) scale(1.05);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.2);
+}
+
+#moodle-minimized-btn video {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
+}
