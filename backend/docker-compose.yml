@@ -3,7 +3,7 @@ version: '3.8'
 services:
   moodle_db:
     image: pgvector/pgvector:pg16
-    container_name: moodle_vector_db
+    container_name: moodle_db
     env_file:
       - .env  # Читаем переменные из файла
     environment:
@@ -19,11 +19,13 @@ services:
 
   moodle_backend:
     build: .
-    container_name: moodle_fastapi
+    container_name: moodle_backend
     ports:
       - "8000:8000"
     depends_on:
       - moodle_db
+    volumes:
+      - .:/app
     env_file:
       - .env  # Читаем переменные для бэкенда
     environment:

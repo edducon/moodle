@@ -1,30 +1,23 @@
 import os
+import re
 import copy
-from fastapi import FastAPI, Depends, Request, Response
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from typing import List, Dict, Any
 from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, Depends, Request, Response
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
-# Импортируем наши модели из database.py
+from config import settings
 from database import SessionLocal, Course, ModuleIndex
 
 app = FastAPI(title="Moodle Assistant API")
 
-# --- ПОДКЛЮЧЕНИЕ К ЛОКАЛЬНОМУ ИИ (Ollama) ---
-# Динамически получаем URL. Если переменной нет (запуск без Докера), используем localhost.
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/v1")
-
-client = OpenAI(
-    base_url=OLLAMA_URL,
-    api_key='ollama'  # Заглушка
-)
-
-# Загружаем векторную модель для русского языка (скачается при первом запуске)
-embedder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+client = OpenAI(base_url=settings.OLLAMA_URL, api_key="ollama")
+embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 
 @app.middleware("http")
@@ -33,7 +26,8 @@ async def custom_cors_middleware(request: Request, call_next):
         response = Response(status_code=200)
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers[
+            "Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept, Origin, X-Requested-With"
         response.headers["Access-Control-Allow-Private-Network"] = "true"
         return response
 
@@ -51,31 +45,107 @@ def get_db():
         db.close()
 
 
-# --- МОДЕЛИ ДАННЫХ ---
+# --- СХЕМЫ ДАННЫХ ---
 class CourseData(BaseModel):
     course_id: str
     title: str
     sections: List[Dict[str, Any]]
+    viewer_role: Optional[str] = None
 
 
 class ModuleUpdateData(BaseModel):
     course_id: str
     moodle_id: str
+    module_type: Optional[str] = None
     content_text: str
+    url: str
+    visibility: Optional[Dict[str, Any]] = None
+
+
+class BulkModuleItem(BaseModel):
+    moodle_id: str
+    title: str
+    module_type: Optional[str] = None
+    content_text: str
+    url: str
+    visibility: Optional[Dict[str, Any]] = None
+
+
+class BulkModuleUpdateData(BaseModel):
+    course_id: str
+    modules: List[BulkModuleItem]
+
+
+class ChatHistoryItem(BaseModel):
+    role: str
+    content: str
+
+
+class DeadlineItem(BaseModel):
+    title: str
+    due_date: str
     url: str
 
 
 class SmartSearchRequest(BaseModel):
     course_id: str
     message: str
+    history: List[ChatHistoryItem] = []
+    viewer_role: Optional[str] = None
+    deadlines: List[DeadlineItem] = []
 
 
-@app.get("/")
-def read_root():
-    return {"message": "Сервер Moodle Bot работает в штатном режиме!"}
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def db_module_visible_for_role(mod: ModuleIndex, viewer_role: Optional[str]) -> bool:
+    visibility = mod.visibility or {}
+    if viewer_role == "teacher":
+        return True
+    if visibility.get("is_hidden", False) or visibility.get("has_restrictions", False):
+        return False
+    return True
 
 
-# --- ЭНДПОИНТ 1: СОХРАНЕНИЕ ОГЛАВЛЕНИЯ ---
+def get_module_format(title: str, mod_type: str, url: str) -> str:
+    """Определяет формат материала, чтобы ИИ понимал, куда отправлять пользователя."""
+    title_lower = (title or "").lower()
+
+    if mod_type == "quiz" or "тест" in title_lower:
+        return "Тест / Экзамен"
+
+    if mod_type == "assign" or "задание" in title_lower or "практическ" in title_lower:
+        return "Практическое задание"
+
+    if "видео" in title_lower or "youtube" in str(url):
+        return "Видеолекция"
+
+    if mod_type in ["forum", "chat"] or "перекличка" in title_lower or "обсужден" in title_lower:
+        return "Форум / Обсуждение"
+
+    if mod_type == "folder":
+        return "Папка с файлами"
+
+    if mod_type == "checklist":
+        return "Контрольный список (Чек-лист)"
+
+    return "Текстовый материал"
+
+
+def split_text_into_chunks(text: str, chunk_size: int = 1500, overlap: int = 300) -> List[str]:
+    if not text:
+        return []
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks = []
+    start = 0
+    text_len = len(text)
+
+    while start < text_len:
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+
+# --- API ENDPOINTS ---
 @app.post("/api/course/sync")
 def sync_course(data: CourseData, db: Session = Depends(get_db)):
     db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
@@ -87,136 +157,219 @@ def sync_course(data: CourseData, db: Session = Depends(get_db)):
         db_course = Course(course_id=data.course_id, title=data.title, content=data.sections)
         db.add(db_course)
     db.commit()
-    return {"status": "success"}
+
+    vectors_count = db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count()
+    return {"status": "success", "needs_initial_sync": vectors_count == 0}
 
 
-# --- ЭНДПОИНТ 2: СОХРАНЕНИЕ ТЕКСТОВ И ВЕКТОРОВ ЛЕКЦИЙ ---
 @app.post("/api/module/update")
 def update_module_content(data: ModuleUpdateData, db: Session = Depends(get_db)):
     db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
     if not db_course:
-        return {"status": "error", "message": "Курс не найден"}
+        return {"status": "error", "reason": "course_not_found"}
 
     sections = copy.deepcopy(db_course.content)
     mod_title = "Без названия"
+    mod_type = data.module_type
+    mod_visibility = data.visibility or {}
     updated = False
 
     for sec in sections:
         for mod in sec.get("modules", []):
             if mod.get("moodle_id") == data.moodle_id:
-                mod["content_text"] = data.content_text
+                mod["content_text"] = "Текст обновлен и разбит на чанки"
                 mod["url"] = data.url
+                mod["visibility"] = mod_visibility
                 mod_title = mod.get("title", "Без названия")
+                mod_type = mod.get("type", mod_type)
                 updated = True
                 break
-        if updated: break
+        if updated:
+            break
 
-    if updated:
-        # Обновляем JSONB для иерархии курса
-        db_course.content = sections
-        db_course.last_updated = datetime.now(timezone.utc)
+    db_course.content = sections
+    db_course.last_updated = datetime.now(timezone.utc)
 
-        # МАГИЯ ВЕКТОРОВ: Превращаем текст в массив чисел
-        text_to_embed = mod_title + " " + data.content_text
-        vector = embedder.encode([text_to_embed])[0].tolist()
+    db.query(ModuleIndex).filter(ModuleIndex.moodle_id == data.moodle_id).delete()
 
-        # Сохраняем или обновляем плоскую таблицу (для быстрого поиска)
-        db_index = db.query(ModuleIndex).filter(ModuleIndex.moodle_id == data.moodle_id).first()
-        if db_index:
-            db_index.title = mod_title
-            db_index.content_text = data.content_text
-            db_index.embedding = vector
-        else:
-            db_index = ModuleIndex(
-                moodle_id=data.moodle_id,
-                course_id=data.course_id,
-                title=mod_title,
-                content_text=data.content_text,
-                embedding=vector
-            )
-            db.add(db_index)
+    chunks = split_text_into_chunks(data.content_text)
+    if not chunks:
+        chunks = ["(Нет текстового содержимого)"]
 
-        db.commit()
-        print(f"✅ Вектор сохранен: {data.moodle_id}")
-        return {"status": "success"}
+    vectors = embedder.encode([f"{mod_title}\n{chunk}" for chunk in chunks]).tolist()
 
-    return {"status": "ignored"}
+    for chunk, vector in zip(chunks, vectors):
+        db_index = ModuleIndex(
+            moodle_id=data.moodle_id,
+            course_id=data.course_id,
+            module_type=mod_type,
+            title=mod_title,
+            content_text=chunk,
+            url=data.url,
+            visibility=mod_visibility,
+            embedding=vector
+        )
+        db.add(db_index)
+
+    db.commit()
+    return {"status": "success"}
 
 
-# --- ЭНДПОИНТ 3: ИИ-НАСТАВНИК (ВЕКТОРНЫЙ ПОИСК В БД + OLLAMA) ---
+@app.post("/api/module/bulk-update")
+def bulk_update_modules(data: BulkModuleUpdateData, db: Session = Depends(get_db)):
+    db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
+    if not db_course:
+        return {"status": "error", "reason": "course_not_found"}
+
+    moodle_ids_to_update = [m.moodle_id for m in data.modules]
+    if moodle_ids_to_update:
+        db.query(ModuleIndex).filter(
+            ModuleIndex.course_id == data.course_id,
+            ModuleIndex.moodle_id.in_(moodle_ids_to_update)
+        ).delete(synchronize_session=False)
+
+    texts_to_embed = []
+    chunk_metadata = []
+
+    for incoming_mod in data.modules:
+        mod_title = incoming_mod.title if hasattr(incoming_mod, 'title') and incoming_mod.title else "Без названия"
+        mod_type = incoming_mod.module_type
+        mod_visibility = incoming_mod.visibility or {}
+
+        chunks = split_text_into_chunks(incoming_mod.content_text)
+        if not chunks:
+            continue
+
+        for chunk in chunks:
+            texts_to_embed.append(f"{mod_title}\n{chunk}")
+            chunk_metadata.append({
+                "moodle_id": incoming_mod.moodle_id,
+                "module_type": mod_type,
+                "title": mod_title,
+                "content_text": chunk,
+                "url": incoming_mod.url,
+                "visibility": mod_visibility
+            })
+
+    if texts_to_embed:
+        batch_size = 16
+        for i in range(0, len(texts_to_embed), batch_size):
+            batch_texts = texts_to_embed[i:i + batch_size]
+            vectors = embedder.encode(batch_texts).tolist()
+
+            for j, vector in enumerate(vectors):
+                meta = chunk_metadata[i + j]
+                db_index = ModuleIndex(
+                    moodle_id=meta["moodle_id"],
+                    course_id=data.course_id,
+                    module_type=meta["module_type"],
+                    title=meta["title"],
+                    content_text=meta["content_text"],
+                    url=meta["url"],
+                    visibility=meta["visibility"],
+                    embedding=vector
+                )
+                db.add(db_index)
+
+            db.commit()
+
+    return {"status": "success", "updated_chunks": len(texts_to_embed)}
+
+
 @app.post("/api/smart-search")
 def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
-    user_message_lower = data.message.lower()
-
-    # Базовая логика болталки
-    if any(w in user_message_lower for w in ["привет", "здравствуй", "хай", "добрый день"]):
+    indexed_count = db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count()
+    if indexed_count == 0:
         return {
-            "reply": "Здравствуйте! Я ваш цифровой наставник 🎓. Какой теоретический вопрос или материал курса вас интересует?",
-            "target_id": None}
+            "reply": "Курс еще не проиндексирован. Пожалуйста, дайте мне пару минут на изучение материалов, и попробуйте задать вопрос снова.",
+            "targets": []
+        }
 
-    # Защита от взлома промпта (Prompt Injection)
-    stop_words = ["забудь", "игнорируй", "предыдущие инструкции", "напиши код", "реши за меня"]
-    if any(word in user_message_lower for word in stop_words):
-        return {"reply": "Хорошая попытка! 😉 Но я здесь, чтобы направлять. Вернемся к изучению теории?",
-                "target_id": None}
+    user_msg = data.message.strip()
+    viewer_role = data.viewer_role or "student"
 
-    # 1. Превращаем запрос студента в вектор
-    query_vector = embedder.encode([data.message])[0].tolist()
+    query_vector = embedder.encode([user_msg])[0].tolist()
 
-    # 2. Ищем самый близкий по смыслу текст прямо в PostgreSQL (магия pgvector!)
-    closest_module = db.query(ModuleIndex) \
-        .filter(ModuleIndex.course_id == data.course_id) \
-        .order_by(ModuleIndex.embedding.cosine_distance(query_vector)) \
-        .first()
+    raw_chunks = db.query(ModuleIndex).filter(
+        ModuleIndex.course_id == data.course_id
+    ).order_by(
+        ModuleIndex.embedding.cosine_distance(query_vector)
+    ).limit(15).all()
 
-    context_text = ""
-    target_id = None
-    mod_title = ""
+    visible_chunks = [c for c in raw_chunks if db_module_visible_for_role(c, viewer_role)]
 
-    if closest_module:
-        # Берем первые 2000 символов, чтобы не перегружать локальный ИИ
-        context_text = closest_module.content_text[:2000] if closest_module.content_text else ""
-        target_id = closest_module.moodle_id
-        mod_title = closest_module.title
-        print(f"🎯 Postgres нашел совпадение по векторам: {mod_title}")
+    context_lines = []
+    for c in visible_chunks[:5]:
+        mod_format = get_module_format(c.title, c.module_type, c.url)
+        context_lines.append(
+            f"--- НАЧАЛО МАТЕРИАЛА [ID: {c.moodle_id}] ---\nНазвание: {c.title}\nФормат: {mod_format}\nТекст:\n{c.content_text}\n--- КОНЕЦ МАТЕРИАЛА ---")
 
-    # 3. Формируем промпт для локальной нейросети Qwen2.5
-    system_prompt = """
-    Ты — цифровой ассистент Moodle, строгий, но справедливый преподаватель-наставник.
-    Твоя задача — помогать студенту с теорией, опираясь ТОЛЬКО на предоставленный контекст.
+    context_str = "\n\n".join(context_lines) if context_lines else "ПУСТО. В курсе нет материалов по этому запросу."
 
-    ЖЕСТКИЕ ПРАВИЛА:
-    1. НИКОГДА не пиши код за студента и не решай практические задачи.
-    2. Если в контексте есть нужная информация, дай краткую подсказку и направь студента читать материал.
-    3. Отвечай кратко, емко и по существу (максимум 3-4 предложения).
-    4. Общайся на русском языке.
-    """
+    deadline_lines = [f"- {d.title} (до {d.due_date})" for d in data.deadlines]
+    deadline_str = "\n".join(deadline_lines) if deadline_lines else "НЕТ_ДЕДЛАЙНОВ"
 
-    if target_id and context_text:
-        user_prompt = f"""
-        Я нашел материал «{mod_title}». Отрывок: {context_text}
-        Сообщение студента: \"\"\"{data.message}\"\"\"
-        Сформируй ответ. Скажи, что подсветил материал «{mod_title}» на экране.
-        """
-    else:
-        user_prompt = f"""
-        Сообщение студента: \"\"\"{data.message}\"\"\"
-        Материалы не найдены. Попроси уточнить запрос.
-        """
+    sys_prompt = f"""Ты — СТРОГИЙ БОТ-НАВИГАТОР по образовательному курсу. Твоя ЕДИНСТВЕННАЯ задача — подсказать пользователю, ГДЕ находится нужная ему информация.
 
-    # 4. Отправляем в Ollama
+АБСОЛЮТНЫЕ ПРАВИЛА (НАРУШАТЬ ЗАПРЕЩЕНО):
+1. ЗАПРЕТ НА ОБЪЯСНЕНИЯ: НИКОГДА не объясняй суть терминов! Твой ответ должен быть только навигационным (например: "Теория по этой теме есть в лекции такой-то, а также есть видеолекция").
+2. ПРИОРИТЕТ ТЕКСТА: Если пользователь ищет теорию или материалы, ВСЕГДА используй тег [NAVIGATE: ID_материала] ТОЛЬКО для материалов формата 'Текстовый материал' или 'Папка с файлами'. Про форматы 'Видеолекция' и 'Форум / Обсуждение' просто напиши словами, что они тоже есть в этом разделе, но тег на них не ставь.
+3. ИГНОРИРУЙ ТЕСТЫ И ЗАДАНИЯ ДЛЯ ТЕОРИИ: НИКОГДА не отправляй пользователя (через тег [NAVIGATE: ID_материала]) в 'Тест / Экзамен' или 'Практическое задание', если он ищет теорию или хочет что-то почитать. Направляй туда только если он явно спрашивает про дедлайн, тест или сдачу лабы.
+4. ЗАПРЕТ НА ДОГАДКИ: Ищи совпадения ТОЛЬКО в блоке 'Фрагменты лекций' ниже. Если там нет явного ответа — прямо скажи: "В проиндексированных материалах курса я этого не нашел".
+5. ЗЕРКАЛЬНЫЙ СТИЛЬ: Внимательно проанализируй стиль приветствия пользователя ("Зай", "Привет", официальный). Отвечай в точности в его стиле, но оставайся кратким навигатором. НИКАКИХ системных скобок в ответе.
+6. ДЕДЛАЙНЫ: Если вопрос пользователя — это просто болтовня (smalltalk), поддержи беседу в его стиле и упомяни ближайший дедлайн из блока 'Дедлайны', если он есть.
+7. НАВИГАЦИЯ: Если ты нашел нужный фрагмент (согласно Правилу 2), добавь в самый конец ответа тег: [NAVIGATE: ID_материала].
+
+Фрагменты лекций:
+{context_str}
+
+Дедлайны:
+{deadline_str}
+"""
+
+    messages = [{"role": "system", "content": sys_prompt}]
+    for h in data.history[-4:]:
+        messages.append({"role": h.role if h.role in ["user", "assistant"] else "user", "content": h.content})
+    messages.append({"role": "user", "content": user_msg})
+
     try:
         response = client.chat.completions.create(
-            model="qwen2.5",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.3
+            model=settings.LLM_MODEL,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=500
         )
-        ai_reply = response.choices[0].message.content
+        reply = response.choices[0].message.content
     except Exception as e:
-        print(f"Ошибка при подключении к Ollama: {e}")
-        ai_reply = "Извините, нейромодуль (Ollama) сейчас недоступен. Проверьте, запущена ли она на вашем компьютере."
+        print(f"🚨 ОШИБКА OLLAMA: {e}")
+        return {"reply": "Произошла ошибка при обращении к нейросети.", "targets": []}
 
-    return {"reply": ai_reply, "target_id": target_id}
+    target_id = None
+    target_url = None
+
+    nav_match = re.search(r'\[NAVIGATE:\s*(.*?)\]', reply)
+    if nav_match:
+        target_id = nav_match.group(1).strip()
+        reply = re.sub(r'\[NAVIGATE:\s*.*?\]', '', reply).strip()
+
+        for c in visible_chunks:
+            if c.moodle_id == target_id:
+                target_url = c.url
+                break
+
+    unique_targets = []
+    seen_ids = set()
+    for c in visible_chunks:
+        if c.moodle_id not in seen_ids:
+            seen_ids.add(c.moodle_id)
+            unique_targets.append({"id": c.moodle_id, "url": c.url, "title": c.title})
+
+    return {
+        "reply": reply,
+        "target_url": target_url,
+        "target_id": target_id,
+        "targets": unique_targets[:4]
+    }
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
-
 class Settings(BaseSettings):
     DATABASE_URL: str
     CORS_ORIGINS: str = "*"
@@ -10,12 +9,12 @@ class Settings(BaseSettings):
     DB_PASSWORD: Optional[str] = None
     DB_NAME: Optional[str] = None
     OLLAMA_URL: str = "http://localhost:11434/v1"
+    LLM_MODEL: str = "llama3.1"
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore"
     )
-
 
 settings = Settings()
