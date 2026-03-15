@@ -336,7 +336,10 @@ function injectChatUI() {
     chatWindow.id = 'moodle-bot-chat';
 
     chatWindow.innerHTML = `
-        <div id="moodle-bot-chat-header">Moodle Assistant</div>
+        <div id="moodle-bot-chat-header" style="display: flex; justify-content: space-between; align-items: center; padding: 10px 15px;">
+            <span>Moodle Assistant</span>
+            <button id="moodle-bot-resize-btn" title="Развернуть" style="background: none; border: none; color: white; cursor: pointer; font-size: 18px; padding: 0; display: flex; align-items: center; justify-content: center; height: 24px; width: 24px; transition: 0.2s;">⛶</button>
+        </div>
         <div id="moodle-bot-chat-messages"></div>
         <div id="moodle-bot-chat-input-area">
             <input type="text" id="moodle-bot-chat-input" placeholder="Введите ваш вопрос...">
@@ -350,6 +353,38 @@ function injectChatUI() {
     const inputField = document.getElementById('moodle-bot-chat-input');
     const historyKey = `moodle_bot_chat_history_${getCourseId()}`;
     const welcomeKey = `moodle_bot_welcome_${getCourseId()}`;
+    const resizeBtn = document.getElementById('moodle-bot-resize-btn');
+
+    // --- НОВАЯ ЛОГИКА: Увеличение размера чата ---
+    let isExpanded = false;
+
+    // Добавляем плавную анимацию для самого окна чата
+    chatWindow.style.transition = 'width 0.3s ease, height 0.3s ease';
+
+    resizeBtn.addEventListener('click', (e) => {
+        e.stopPropagation(); // Чтобы клик не срабатывал на других элементах
+        isExpanded = !isExpanded;
+
+        if (isExpanded) {
+            // Увеличиваем (не на весь экран, но комфортно для чтения)
+            chatWindow.style.width = '600px';
+            chatWindow.style.height = '80vh'; // 80% от высоты экрана
+            resizeBtn.innerHTML = '🗗';        // Меняем иконку на "Свернуть"
+            resizeBtn.title = 'Уменьшить';
+        } else {
+            // Сбрасываем стили (вернутся значения по умолчанию из style.css)
+            chatWindow.style.width = '';
+            chatWindow.style.height = '';
+            resizeBtn.innerHTML = '⛶';        // Возвращаем иконку "Развернуть"
+            resizeBtn.title = 'Развернуть';
+        }
+
+        // Автоматически прокручиваем вниз при изменении размера
+        setTimeout(() => {
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+        }, 310); // Ждем окончания анимации
+    });
+    // ----------------------------------------------
 
     let savedHistory = sessionStorage.getItem(historyKey);
     if (!savedHistory) {
@@ -452,7 +487,13 @@ function injectChatUI() {
                 return;
             }
 
-            let finalHtml = `<div class="bot-msg">${data.reply}</div>`;
+            // Улучшенное форматирование: переносы, жирный текст и списки
+            let formattedReply = data.reply
+                .replace(/\n/g, '<br>')                   // Возвращаем переносы строк
+                .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')   // Делаем текст жирным
+                .replace(/\* /g, '<br>• ');               // Превращаем звездочки в красивые маркеры списка
+
+            let finalHtml = `<div class="bot-msg">${formattedReply}</div>`;
 
             if (data.targets && data.targets.length > 0) {
                 finalHtml += `<div style="margin-top: -5px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px;">`;
@@ -471,6 +512,25 @@ function injectChatUI() {
 
                 finalHtml += `</div>`;
             }
+
+            // --- ПАНЕЛЬ ОТЛАДКИ (Источники ИИ) ---
+            if (data.debug_context && data.debug_context.length > 0) {
+                finalHtml += `
+                <details style="margin-top: 8px; font-size: 11px; background: #e9ecef; border-radius: 6px; padding: 5px; border: 1px solid #ced4da;">
+                    <summary style="cursor: pointer; color: #495057; font-weight: bold; outline: none;">🔍 Показать источники (Дебаг)</summary>
+                    <div style="margin-top: 5px; max-height: 200px; overflow-y: auto; padding-right: 5px;">`;
+
+                data.debug_context.forEach((ctx, idx) => {
+                    finalHtml += `
+                        <div style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid #dee2e6;">
+                            <strong style="color: #0056b3;">[${idx + 1}] ${ctx.title}</strong><br>
+                            <span style="color: #6c757d; font-family: monospace;">${ctx.text}</span>
+                        </div>`;
+                });
+
+                finalHtml += `</div></details>`;
+            }
+            // ------------------------------------
 
             addMessageToChat(finalHtml);
 
