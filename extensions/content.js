@@ -146,27 +146,47 @@ function getModuleType(act) {
 }
 
 function extractMeaningfulContent(doc) {
-    const candidates = [
-        doc.querySelector('[role="main"]'),
-        doc.querySelector('#region-main'),
-        doc.querySelector('.activity-header'),
-        doc.querySelector('.resourcecontent'),
-        doc.querySelector('.box.generalbox'),
-        doc.querySelector('.book_content'),
-        doc.querySelector('.quizinfo'),
-        doc.querySelector('.submissionstatustable'),
-        doc.body
-    ].filter(Boolean);
+    // Ищем самый подходящий контейнер с контентом
+    const mainNode =
+        doc.querySelector('[role="main"]') ||
+        doc.querySelector('#region-main') ||
+        doc.querySelector('.resourcecontent') ||
+        doc.querySelector('.box.generalbox') ||
+        doc.querySelector('.book_content') ||
+        doc.body;
 
-    let bestText = '';
-    for (const node of candidates) {
-        const text = cleanText(node.innerText);
-        if (text.length > bestText.length) {
-            bestText = text;
-        }
-    }
+    if (!mainNode) return '';
 
-    return bestText;
+    // Создаем копию узла, чтобы не сломать верстку на реальной странице пользователя
+    const clone = mainNode.cloneNode(true);
+
+    // Черный список: CSS-селекторы мусора Moodle (чаты, меню, футеры, скрытые элементы)
+    const selectorsToRemove = [
+        '#nav-drawer',                   // Боковое меню
+        '[data-region="drawer"]',        // Выдвижные панели (в т.ч. чат/собеседники)
+        '[data-region="message-drawer"]',// Панель сообщений
+        '.popover-region',               // Уведомления Moodle
+        '#page-footer',                  // Подвал
+        'footer',                        // Тег футера
+        'nav',                           // Меню навигации
+        '.navbar',                       // Верхняя шапка
+        '.block',                        // Боковые информационные блоки
+        '.activity-navigation',          // Кнопки "Следующая/Предыдущая лекция"
+        '.sr-only',                      // Текст для слепых (скринридеров)
+        '.hidden',                       // Скрытые элементы
+        'script',                        // Скрипты
+        'style'                          // Стили
+    ];
+
+    // Удаляем весь мусор из нашей копии страницы
+    selectorsToRemove.forEach(selector => {
+        clone.querySelectorAll(selector).forEach(el => el.remove());
+    });
+
+    // Теперь извлекаем идеально чистый текст
+    let text = clone.innerText || clone.textContent || '';
+
+    return cleanText(text);
 }
 
 function shouldIndexModuleType(type) {
@@ -417,6 +437,12 @@ function injectChatUI() {
 
         const targetUrl = btn.getAttribute('data-url');
         const targetId = btn.getAttribute('data-id');
+        const targetSnippet = btn.getAttribute('data-snippet'); // <--- Читаем текст
+
+        // Сохраняем текст, который нужно будет найти и подсветить
+        if (targetSnippet) {
+            sessionStorage.setItem('moodle_bot_highlight_text', targetSnippet);
+        }
 
         const currentUrlObj = new URL(window.location.href);
         const targetUrlObj = new URL(targetUrl);
@@ -477,16 +503,6 @@ function injectChatUI() {
 
             const data = await response.json();
 
-            if (data.target_url && window.location.href.split('#')[0] !== data.target_url.split('#')[0]) {
-                sessionStorage.setItem('moodle_bot_teleport_msg', data.reply);
-                sessionStorage.setItem('moodle_bot_teleport_target', data.target_id || '');
-                addMessageToChat(`<div class="bot-msg">Нашел! Перехожу к нужному материалу... 🚀</div>`);
-                setTimeout(() => {
-                    window.location.href = data.target_url;
-                }, 1200);
-                return;
-            }
-
             // Улучшенное форматирование: переносы, жирный текст и списки
             let formattedReply = data.reply
                 .replace(/\n/g, '<br>')                   // Возвращаем переносы строк
@@ -504,6 +520,7 @@ function injectChatUI() {
                         <button class="moodle-bot-target-btn"
                                 data-url="${t.url}"
                                 data-id="${t.id}"
+                                data-snippet="${t.snippet}" 
                                 style="text-align: left; padding: 6px 10px; background: #f8f9fa; border: 1px solid #cce5ff; border-radius: 6px; cursor: pointer; color: #004085; font-size: 12px; transition: 0.2s;">
                             🎯 Переход: ${t.title}
                         </button>
@@ -753,6 +770,44 @@ async function passiveModuleSync() {
 // === ТОЧКА ВХОДА ===
 setTimeout(async () => {
     injectChatUI();
+
+    // --- НОВЫЙ БЛОК: ПОИСК И ПОДСВЕТКА ТЕКСТА ОТ ИИ ---
+    const textToHighlight = sessionStorage.getItem('moodle_bot_highlight_text');
+    if (textToHighlight) {
+        sessionStorage.removeItem('moodle_bot_highlight_text'); // Сразу очищаем память
+
+        setTimeout(() => {
+            // Используем встроенный поиск браузера. Он сам проскроллит экран куда надо!
+            if (window.find(textToHighlight)) {
+                const selection = window.getSelection();
+                if (selection.rangeCount > 0) {
+                    try {
+                        const range = selection.getRangeAt(0);
+                        const span = document.createElement('span');
+                        span.style.backgroundColor = '#fff3cd'; // Нежно-желтый фон
+                        span.style.borderBottom = '2px solid #ffc107'; // Яркая линия внизу
+                        span.style.transition = 'background-color 3s';
+                        span.style.padding = '2px';
+                        span.style.borderRadius = '3px';
+
+                        range.surroundContents(span);
+                        selection.removeAllRanges(); // Снимаем стандартное синее выделение текста
+
+                        // Плавное затухание маркера через 4 секунды
+                        setTimeout(() => {
+                            span.style.backgroundColor = 'transparent';
+                            span.style.borderBottom = 'none';
+                        }, 4000);
+                    } catch (err) {
+                        // Если текст разбит сложными HTML-тегами, оставляем стандартное выделение
+                        console.log("Не удалось обернуть текст в span, но скролл сработал");
+                    }
+                }
+            }
+        }, 800); // Ждем 800мс, чтобы тяжелые страницы Moodle успели загрузиться
+    }
+    // --- КОНЕЦ НОВОГО БЛОКА ---
+
 
     const path = window.location.pathname;
     const isTeacher = isTeacherView();
