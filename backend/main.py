@@ -124,32 +124,59 @@ def get_module_format(title: str, mod_type: str, url: str) -> str:
     return "Текстовый материал"
 
 
-def split_text_into_chunks(text: str, chunk_size: int = 600, overlap: int = 150) -> List[str]:
+def split_text_into_chunks(text: str, min_size: int = 200, max_size: int = 900) -> List[str]:
+    """Умная нарезка текста по абзацам (Semantic Chunking)."""
     if not text:
         return []
-    text = re.sub(r"\s+", " ", text).strip()
-    chunks = []
-    start = 0
-    text_len = len(text)
 
-    while start < text_len:
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
+    # Скрипт Moodle (content.js) присылает нам абзацы, разделенные переносами строк \n
+    paragraphs = re.split(r'\n+', text.strip())
+
+    chunks = []
+    current_chunk = ""
+
+    for p in paragraphs:
+        p = p.strip()
+        if not p or len(p) < 10:  # Игнорируем пустые строки и мусорные огрызки
+            continue
+
+        # Если сам по себе абзац просто гигантский (например, препод забыл нажать Enter)
+        if len(p) > max_size:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            # Режем гиганта кусками (очень редкий случай)
+            start = 0
+            while start < len(p):
+                chunks.append(p[start:start + max_size])
+                start += max_size
+            continue
+
+        # Пытаемся добавить абзац к текущему чанку
+        if len(current_chunk) + len(p) + 1 <= max_size:
+            current_chunk += ("\n" + p if current_chunk else p)
+        else:
+            # Чанк заполнен! Сохраняем его и начинаем новый
+            if len(current_chunk) >= min_size:
+                chunks.append(current_chunk.strip())
+            current_chunk = p
+
+    # Сохраняем последний кусочек, если он остался
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
     return chunks
 
 
 def get_best_snippet(chunk_text: str, query: str) -> str:
-    """Ищет предложение внутри чанка, которое лучше всего отвечает на вопрос пользователя."""
+    """Ищет предложение с ключевым словом."""
     if not chunk_text or not query:
         return ""
 
-    # Разбиваем текст на предложения
     sentences = re.split(r'(?<=[.!?])\s+', chunk_text)
-
-    # Достаем значимые слова из запроса (от 4 букв, отбрасываем "что", "такое" и т.д.)
+    # Сюда уже будет прилетать расширенный запрос с синонимами
     query_words = set(re.findall(r'[а-яА-Яa-zA-Z0-9]{4,}', query.lower()))
-    stop_words = {"что", "такое", "какой", "где", "когда", "почему", "зачем", "как", "расскажи"}
+    stop_words = {"что", "такое", "какой", "какие", "где", "когда", "почему", "зачем", "как", "расскажи", "виды"}
     keywords = {w for w in query_words if w not in stop_words}
 
     best_sentence = sentences[0] if sentences else chunk_text
@@ -159,17 +186,35 @@ def get_best_snippet(chunk_text: str, query: str) -> str:
         s_lower = s.lower()
         score = 0
         for kw in keywords:
-            # Берем корень слова (отсекаем 2 последние буквы для поиска по падежам)
             root = kw[:-2] if len(kw) > 5 else kw
             if root in s_lower:
                 score += 1
+                if re.search(rf'\b{root}[а-яa-z]*\s*[-–—]', s_lower): score += 5
+                if re.search(rf'\b{root}[а-яa-z]*\s+(это|позволяет|является|представляет|означает)', s_lower): score += 4
+                if s_lower.strip().startswith(root): score += 2
 
         if score > max_score:
             max_score = score
             best_sentence = s
 
-    # Возвращаем 6-7 слов из самого релевантного предложения для желтого маркера
-    return " ".join(best_sentence.split()[:6])
+    words = best_sentence.split()
+    target_idx = -1
+    for i, w in enumerate(words):
+        w_lower = w.lower()
+        if any(kw[:-2] in w_lower for kw in keywords if len(kw) > 3):
+            target_idx = i
+            break
+
+    # Умный Фолбэк: если слово так и не нашли (например, из-за опечатки "отстутпы"),
+    # но нейросеть уверена, что текст правильный — возвращаем начало абзаца!
+    if target_idx == -1:
+        fallback_snippet = " ".join(sentences[0].split()[:6]) if sentences else " ".join(words[:6])
+        return re.sub(r'\s+', ' ', fallback_snippet).strip()
+
+    start = max(0, target_idx - 2)
+    end = min(len(words), target_idx + 5)
+    snippet = " ".join(words[start:end])
+    return re.sub(r'\s+', ' ', snippet).strip()
 
 # --- API ENDPOINTS ---
 @app.post("/api/course/sync")
@@ -314,18 +359,55 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     user_msg = data.message.strip()
     viewer_role = data.viewer_role or "student"
 
+    # === 1. ГЛОБАЛЬНОЕ РАСШИРЕНИЕ ЗАПРОСА (СИНОНИМЫ) ===
+    query_expanded = user_msg.lower()
+    synonyms = {
+        "лаборатор": "отчет практическ",
+        "лаб": "отчет",
+        "ворд": "word",
+        "пдф": "pdf",
+        "отступ": "форматирование поля интервал шрифт"  # Докинули термины для верности
+    }
+    for k, v in synonyms.items():
+        if k in query_expanded:
+            query_expanded += f" {v}"
+
     query_vector = embedder.encode([user_msg])[0].tolist()
 
-    raw_chunks = db.query(ModuleIndex).filter(
+    # === 2. ГИБРИДНЫЙ ПОИСК И СКОРРИНГ ===
+    distance_col = ModuleIndex.embedding.cosine_distance(query_vector)
+    raw_results = db.query(ModuleIndex, distance_col.label('distance')).filter(
         ModuleIndex.course_id == data.course_id
-    ).order_by(
-        ModuleIndex.embedding.cosine_distance(query_vector)
-    ).limit(15).all()
+    ).order_by(distance_col).limit(100).all()
 
-    visible_chunks = [c for c in raw_chunks if db_module_visible_for_role(c, viewer_role)]
-    # Берем 3 самых релевантных, чтобы не путать ИИ дублями
+    stop_words = {"что", "такое", "какой", "какие", "где", "когда", "почему", "зачем", "как", "расскажи", "виды"}
+    # Сортировщик теперь использует расширенный запрос!
+    query_words = set(re.findall(r'[а-яА-Яa-zA-Z0-9]{4,}', query_expanded))
+    keywords = {w for w in query_words if w not in stop_words}
+
+    scored_chunks = []
+    for c, dist in raw_results:
+        text_lower = (c.content_text or "").lower()
+        title_lower = (c.title or "").lower()
+
+        match_bonus = 0
+        for kw in keywords:
+            root = kw[:-2] if len(kw) > 5 else kw
+            # МЕГА-БОНУС: если слово (или синоним) есть в заголовке, лекция взлетает в топ!
+            if root in title_lower:
+                match_bonus += 0.4
+            elif root in text_lower:
+                match_bonus += 0.15
+
+        final_score = dist - match_bonus
+        scored_chunks.append((final_score, c))
+
+    scored_chunks.sort(key=lambda x: x[0])
+    raw_chunks = [c for score, c in scored_chunks]
+
+    # Берем ТОП-5 релевантных материалов (даем нейросети больше контекста)
     context_lines = []
-    for c in visible_chunks[:3]:
+    for c in visible_chunks[:5]:
         mod_format = get_module_format(c.title, c.module_type, c.url)
         context_lines.append(
             f"--- НАЧАЛО МАТЕРИАЛА [ID: {c.moodle_id}] ---\nНазвание: {c.title}\nФормат: {mod_format}\nТекст:\n{c.content_text}\n--- КОНЕЦ МАТЕРИАЛА ---")
@@ -382,18 +464,20 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         for c in visible_chunks:
             if c.moodle_id == target_id:
                 target_url = c.url
-                target_snippet = get_best_snippet(c.content_text, user_msg)  # <--- УМНЫЙ СНИППЕТ
+                # ИСПРАВЛЕНИЕ 1: Передаем query_expanded, чтобы синонимы работали и здесь!
+                target_snippet = get_best_snippet(c.content_text, query_expanded)
                 break
 
+    # ИСПРАВЛЕНИЕ 2: Сдвинули блок влево (он больше не внутри if nav_match)
+    # === ГЕНЕРАЦИЯ КНОПОК ===
     unique_targets = []
     seen_titles = set()
-    for c in visible_chunks:
+
+    for c in visible_chunks[:5]:
         clean_title = (c.title or "").strip().lower()
         if clean_title not in seen_titles:
             seen_titles.add(clean_title)
-
-            # Сохраняем кусочек текста отдельным полем
-            snippet = get_best_snippet(c.content_text, user_msg)  # <--- УМНЫЙ СНИППЕТ
+            snippet = get_best_snippet(c.content_text, query_expanded)
 
             unique_targets.append({
                 "id": c.moodle_id,
@@ -402,19 +486,21 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
                 "snippet": snippet
             })
 
+        if len(unique_targets) >= 4:
+            break
+
     debug_context = []
-    for c in visible_chunks[:5]:
+    for c in visible_chunks[:3]:
         debug_context.append({"title": c.title, "text": c.content_text})
 
     return {
         "reply": reply,
         "target_url": target_url,
         "target_id": target_id,
-        "target_snippet": target_snippet,  # <--- Добавили передачу сниппета
-        "targets": unique_targets[:4],
+        "target_snippet": target_snippet,
+        "targets": unique_targets,
         "debug_context": debug_context
     }
-
 
 if __name__ == "__main__":
     import uvicorn

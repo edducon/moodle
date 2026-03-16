@@ -206,6 +206,24 @@ function shouldIndexModuleType(type) {
     ].includes(type);
 }
 
+function isFileActivity(act) {
+    if (!act) return false;
+
+    // Проверяем по системной иконке Moodle (f/pdf, f/document, f/powerpoint и т.д.)
+    const icon = act.querySelector('img.icon');
+    if (icon && icon.src) {
+        const src = icon.src.toLowerCase();
+        const fileIcons = ['/f/pdf', '/f/document', '/f/spreadsheet', '/f/powerpoint', '/f/archive', '/f/text', '/f/word', '/f/excel'];
+        if (fileIcons.some(f => src.includes(f))) return true;
+    }
+
+    // Проверяем скрытые метки Moodle для слепых (они часто пишут там слово "Файл")
+    const typeEl = act.querySelector('.accesshide');
+    if (typeEl && typeEl.innerText.toLowerCase().includes('файл')) return true;
+
+    return false;
+}
+
 async function extractDeadlinesFromCourse() {
     const doms = await getCourseDOMs();
     const deadlines = [];
@@ -676,7 +694,8 @@ async function runSilentSpider() {
                     module_type: moduleType,
                     title: extractModuleTitle(act),
                     visibility: extractVisibilityInfo(act),
-                    inline_desc: inlineDescription
+                    inline_desc: inlineDescription,
+                    is_file: isFileActivity(act) // <--- ДОБАВИЛИ ФЛАГ
                 });
             }
         });
@@ -689,19 +708,54 @@ async function runSilentSpider() {
 
         const promises = chunk.map(async (item) => {
             try {
+                // 1. ЕСЛИ ЭТО ФАЙЛ (PDF, Word) - НЕ СКАЧИВАЕМ ЕГО!
+                // Экономим трафик и сразу генерируем SEO-описание
+                if (item.is_file) {
+                    const fileSeoText = `Это прикрепленный учебный материал (документ, файл или презентация) по теме "${item.title}". Обязательно откройте и изучите этот файл, так как он целиком посвящен теме "${item.title}". ${item.inline_desc || ''}`;
+                    return {
+                        moodle_id: item.moodle_id,
+                        title: item.title,
+                        module_type: item.module_type,
+                        content_text: cleanText(fileSeoText),
+                        url: item.href,
+                        visibility: item.visibility
+                    };
+                }
+
+                // 2. ЕСЛИ ЭТО СТРАНИЦА - ИДЕМ ЧИТАТЬ ЕЁ
                 const response = await fetch(item.href, { credentials: 'include' });
+
+                // Защита №2: Если сервер подсунул нам файл без иконки (проверяем заголовки ДО скачивания тела)
+                const contentType = response.headers.get('content-type');
+                if (contentType && !contentType.includes('text/html')) {
+                    const fileSeoText = `Это загружаемый файл по теме "${item.title}". Он предназначен для изучения темы "${item.title}". ${item.inline_desc || ''}`;
+                    return {
+                        moodle_id: item.moodle_id,
+                        title: item.title,
+                        module_type: item.module_type,
+                        content_text: cleanText(fileSeoText),
+                        url: item.href,
+                        visibility: item.visibility
+                    };
+                }
+
+                // Читаем текст страницы
                 const html = await response.text();
                 const doc = new DOMParser().parseFromString(html, "text/html");
-
                 let text = extractMeaningfulContent(doc);
 
                 if (item.inline_desc) {
                     text = item.inline_desc + "\n" + text;
                 }
 
+                // 3. УМНОЕ ОБОГАЩЕНИЕ МЕДИА-КОНТЕНТА (Видео, короткие ссылки)
                 if (!text || text.length < 80) {
-                    const pageTitle = cleanText(doc.title);
-                    text = cleanText(`${item.title} ${pageTitle} ${text}`);
+                    const hasVideo = doc.querySelector('iframe, video, .mediaplugin');
+                    if (hasVideo || item.title.toLowerCase().includes('видео')) {
+                        text = cleanText(`Это обучающая видеолекция по теме "${item.title}". Данный медиаматериал целиком и полностью посвящен изучению темы "${item.title}". Обязательно посмотрите это видео, чтобы понять ${item.title}. ${item.inline_desc || ''}`);
+                    } else {
+                        text = cleanText(`Это практический материал или важная ссылка по теме "${item.title}". Относится к разделу ${item.title}. ${item.inline_desc || ''}`);
+                    }
                 }
 
                 if (!text) return null;
@@ -771,43 +825,66 @@ async function passiveModuleSync() {
 setTimeout(async () => {
     injectChatUI();
 
-    // --- НОВЫЙ БЛОК: ПОИСК И ПОДСВЕТКА ТЕКСТА ОТ ИИ ---
+    // --- НОВЫЙ БЛОК: NOTION-STYLE ПОДСВЕТКА АБЗАЦЕВ ---
     const textToHighlight = sessionStorage.getItem('moodle_bot_highlight_text');
     if (textToHighlight) {
-        sessionStorage.removeItem('moodle_bot_highlight_text'); // Сразу очищаем память
+        sessionStorage.removeItem('moodle_bot_highlight_text');
+
+        // Внедряем красивые стили для анимации (Пульсация с левой рамкой)
+        if (!document.getElementById('bot-highlight-styles')) {
+            const style = document.createElement('style');
+            style.id = 'bot-highlight-styles';
+            style.innerHTML = `
+                @keyframes botPulse {
+                    0% { background-color: rgba(255, 193, 7, 0.1); border-left: 4px solid transparent; }
+                    20% { background-color: rgba(255, 193, 7, 0.3); border-left: 4px solid #ffc107; transform: translateX(3px); }
+                    80% { background-color: rgba(255, 193, 7, 0.3); border-left: 4px solid #ffc107; transform: translateX(0); }
+                    100% { background-color: transparent; border-left: 4px solid transparent; }
+                }
+                .bot-highlight-animation {
+                    animation: botPulse 4s ease-in-out !important;
+                    border-radius: 2px;
+                }
+            `;
+            document.head.appendChild(style);
+        }
 
         setTimeout(() => {
-            // Используем встроенный поиск браузера. Он сам проскроллит экран куда надо!
+            const mainContent = document.querySelector('[role="main"]') || document.querySelector('#region-main') || document.body;
+
+            // Устанавливаем курсор браузера в начало контента лекции
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            const range = document.createRange();
+            range.selectNodeContents(mainContent);
+            range.collapse(true);
+            sel.addRange(range);
+
             if (window.find(textToHighlight)) {
-                const selection = window.getSelection();
-                if (selection.rangeCount > 0) {
-                    try {
-                        const range = selection.getRangeAt(0);
-                        const span = document.createElement('span');
-                        span.style.backgroundColor = '#fff3cd'; // Нежно-желтый фон
-                        span.style.borderBottom = '2px solid #ffc107'; // Яркая линия внизу
-                        span.style.transition = 'background-color 3s';
-                        span.style.padding = '2px';
-                        span.style.borderRadius = '3px';
+                const foundRange = sel.getRangeAt(0);
+                let node = foundRange.commonAncestorContainer;
 
-                        range.surroundContents(span);
-                        selection.removeAllRanges(); // Снимаем стандартное синее выделение текста
-
-                        // Плавное затухание маркера через 4 секунды
-                        setTimeout(() => {
-                            span.style.backgroundColor = 'transparent';
-                            span.style.borderBottom = 'none';
-                        }, 4000);
-                    } catch (err) {
-                        // Если текст разбит сложными HTML-тегами, оставляем стандартное выделение
-                        console.log("Не удалось обернуть текст в span, но скролл сработал");
-                    }
+                // Поднимаемся от текста до родительского блочного элемента (p, li, div)
+                if (node.nodeType === 3) node = node.parentNode;
+                while (node && (node.tagName === 'B' || node.tagName === 'STRONG' || node.tagName === 'SPAN' || node.tagName === 'I' || node.tagName === 'A')) {
+                    node = node.parentNode;
                 }
+
+                // Исключаем случайное выделение всей страницы
+                const forbiddenTags = ['BODY', 'MAIN', 'HTML', 'SECTION'];
+                if (node && !forbiddenTags.includes(node.tagName)) {
+                    node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    node.classList.add('bot-highlight-animation');
+
+                    setTimeout(() => node.classList.remove('bot-highlight-animation'), 4000);
+                }
+                sel.removeAllRanges(); // Снимаем синее выделение браузера
+            } else {
+                console.log("[Moodle Bot] Фрагмент не найден на странице:", textToHighlight);
             }
-        }, 800); // Ждем 800мс, чтобы тяжелые страницы Moodle успели загрузиться
+        }, 800);
     }
     // --- КОНЕЦ НОВОГО БЛОКА ---
-
 
     const path = window.location.pathname;
     const isTeacher = isTeacherView();
