@@ -123,8 +123,11 @@ def get_module_format(title: str, mod_type: str, url: str) -> str:
 
 
 def split_text_into_chunks(text: str, min_size: int = 200, max_size: int = 1500) -> List[str]:
+    """Умное семантическое разделение текста с защитой от разрыва слов и очисткой мусора Moodle."""
     if not text:
         return []
+
+    text = re.sub(r'Печатать книгу.*?Оглавление', '', text, flags=re.IGNORECASE | re.DOTALL)
 
     paragraphs = re.split(r'\n+', text.strip())
     chunks = []
@@ -312,40 +315,44 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     user_msg = data.message.strip()
     viewer_role = data.viewer_role or "student"
 
-    # === 1. ОЧИСТКА ЗАПРОСА ОТ ШУМА (УМНЫЙ ПОИСК) ===
-    # Просим LLM вытащить только суть, чтобы векторный поиск не отвлекался на "зайка" и "как дела"
-    clean_prompt = f"""Удали из текста приветствия, обращения и вводные слова (например: 'привет', 'зайка', 'где почитать', 'расскажи про'). 
-    Оставь ТОЛЬКО главные термины или суть вопроса для поисковой системы.
-    Отвечай строго только этими словами.
-    Текст: {user_msg}
-    Результат:"""
+    # === 1. ИЗВЛЕЧЕНИЕ СУТИ ЗАПРОСА (УМНЫЙ ЭКСТРАКТОР ЧЕРЕЗ LLM) ===
+    extract_prompt = f"""Внимательно прочитай запрос пользователя. Твоя цель - вытащить только СУТЬ поиска.
+Удали любые приветствия, странные обращения ('йоу', 'собака', 'зайка', 'наруто узумаки'), шелуху и глаголы ('где почитать', 'найди', 'подскажи').
+Верни ТОЛЬКО термин, тему или предмет поиска. 
+Если в тексте только болтовня, приветствие и НЕТ конкретного предмета для поиска (например "как дела", "привет", "с чего начать курс"), верни ровно одно слово: NONE.
+Отвечай строго без кавычек и точек.
+
+Запрос: "{user_msg}"
+Суть:"""
 
     try:
-        clean_response = client.chat.completions.create(
+        ext_response = client.chat.completions.create(
             model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": clean_prompt}],
+            messages=[{"role": "user", "content": extract_prompt}],
             temperature=0.0,
-            max_tokens=20
+            max_tokens=30
         )
-        search_query = clean_response.choices[0].message.content.strip().lower()
-        search_query = re.sub(r'[^\w\s-]', '', search_query)
-        if not search_query:
-            search_query = user_msg.lower()
+        search_query = ext_response.choices[0].message.content.strip().lower()
+        search_query = re.sub(r'[^\w\s-]', '', search_query)  # Убираем лишнюю пунктуацию
     except Exception as e:
-        search_query = user_msg.lower()
+        search_query = "none"
 
-    query_vector = embedder.encode([search_query])[0].tolist()
+    if search_query == "none" or not search_query:
+        # Это smalltalk или абстрактный вопрос. Ищем по всему вектору, но без бонусов.
+        search_query_vector_text = user_msg.lower()
+        keywords = set()
+    else:
+        # Идеальный чистый запрос для поиска!
+        search_query_vector_text = search_query
+        keywords = set(search_query.split())
 
-    # === 2. ВЕКТОРНЫЙ ПОИСК С УВЕЛИЧЕННЫМ ЛИМИТОМ ===
-    # Берем сразу 100 чанков, чтобы точный ответ точно попал в выборку
+    query_vector = embedder.encode([search_query_vector_text])[0].tolist()
+
+    # === 2. ВЕКТОРНЫЙ ПОИСК И СКОРИНГ ===
     distance_col = ModuleIndex.embedding.cosine_distance(query_vector)
     raw_results = db.query(ModuleIndex, distance_col.label('distance')).filter(
         ModuleIndex.course_id == data.course_id
     ).order_by(distance_col).limit(100).all()
-
-    query_words = set(re.findall(r'[а-яА-Яa-zA-Z0-9]{4,}', search_query))
-    stop_words = {"что", "такое", "какой", "какие", "где", "когда", "почему", "зачем", "как", "расскажи", "виды"}
-    keywords = {w for w in query_words if w not in stop_words}
 
     scored_chunks = []
     for c, dist in raw_results:
@@ -353,30 +360,31 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         text_lower = (c.content_text or "").lower()
         match_bonus = 0
 
-        # Мощный бонус за точное совпадение всей фразы целиком!
-        if search_query and search_query in text_lower:
+        # Мощный бонус за точное совпадение ЧИСТОЙ фразы в тексте
+        if search_query != "none" and search_query in text_lower:
+            match_bonus += 0.5
+        elif search_query != "none" and search_query in title_lower:
             match_bonus += 0.4
 
+        matches = 0
         for kw in keywords:
+            if len(kw) < 4: continue  # Игнорируем предлоги
             root = kw[:-2] if len(kw) > 4 else kw
             if root in title_lower and c.module_type != 'quiz':
-                match_bonus += 0.2
-            elif root in text_lower:
-                match_bonus += 0.15
+                match_bonus += 0.1
+            if root in text_lower:
+                matches += 1
+                match_bonus += 0.1
 
         final_score = dist - match_bonus
 
-        # Пессимизируем тесты, если ищем теорию
         if c.module_type == 'quiz':
             final_score += 0.3
 
         scored_chunks.append((final_score, c))
 
-    # Сортируем по финальному скору (меньше = лучше)
     scored_chunks.sort(key=lambda x: x[0])
     raw_chunks = [c for score, c in scored_chunks]
-
-    # ИСПРАВЛЕНО: Сохраняем скор по уникальному id чанка, а не moodle_id
     chunk_scores = {c.id: score for score, c in scored_chunks}
 
     visible_chunks = [c for c in raw_chunks if db_module_visible_for_role(c, viewer_role)]
@@ -392,28 +400,35 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     deadline_lines = [f"- {d.title} (до {d.due_date})" for d in data.deadlines]
     deadline_str = "\n".join(deadline_lines) if deadline_lines else "НЕТ_ДЕДЛАЙНОВ"
 
+    # === 3. ЖЕЛЕЗОБЕТОННЫЙ ПРОМПТ С FEW-SHOT ПРИМЕРОМ ===
     sys_prompt = f"""Ты — СТРОГИЙ БОТ-НАВИГАТОР по образовательному курсу. Твоя задача — подсказать пользователю, ГДЕ находится информация.
 
-    АБСОЛЮТНЫЕ ПРАВИЛА:
-    1. ЧИСТОТА ОТВЕТА: НИКОГДА не пиши технические идентификаторы (типа module-12345) в тексте самого сообщения для пользователя.
-    2. ЗАПРЕТ НА ОБЪЯСНЕНИЯ: Не давай определения терминам. Только направляй.
-    3. НАВИГАЦИЯ И СНИППЕТ: Если информация найдена, ты ОБЯЗАН добавить в самый конец ответа (с новой строки) два скрытых тега: 
-       - [NAVIGATE: ID_материала] 
-       - [SNIPPET: 1-3 предложения точной цитаты из текста, содержащие ответ]. Цитата должна быть буква в букву!
-    4. SMALLTALK: Если пользователь просто здоровается (smalltalk), ответь в его стиле и напомни про дедлайн (если есть в блоке 'Дедлайны'). Теги NAVIGATE и SNIPPET при smalltalk НЕ СТАВИТЬ.
+АБСОЛЮТНЫЕ ПРАВИЛА:
+1. ИСПОЛЬЗУЙ НАЗВАНИЯ: Бери название материала ТОЛЬКО из поля "Название" во фрагментах. Не придумывай свои названия.
+2. НИКАКИХ ID В ТЕКСТЕ: Никогда не пиши технические идентификаторы (типа module-12345) в тексте самого сообщения для пользователя.
+3. НАВИГАЦИЯ: Если ты рекомендуешь пользователю открыть какой-либо материал (даже на общий вопрос вроде "с чего начать"), ты ОБЯЗАН добавить в самый конец ответа с новой строки тег: [NAVIGATE: ID_материала]. 
+4. СНИППЕТ: Если пользователь ищет конкретное понятие или термин, найди точную цитату (1-3 предложения) в тексте и оберни ее в тег [SNIPPET: точная цитата]. Если вопрос общий (типа "с чего начать"), оставь тег пустым: [SNIPPET: ].
+5. СТРОГО ОДНА КНОПКА: Выдавай только ОДИН тег [NAVIGATE] для самого подходящего материала. Нельзя выдавать несколько тегов!
+6. SMALLTALK: Если пользователь просто здоровается (smalltalk) и ничего не ищет, ответь в его стиле. Теги NAVIGATE и SNIPPET не ставь.
 
-    === ПРИМЕР ИДЕАЛЬНОГО ОТВЕТА ===
-    Привет, зайка! Информацию о нагрузочном тестировании можно найти в материале "Лекция №3".
-    [NAVIGATE: module-234547]
-    [SNIPPET: Нагрузочное тестирование — вид тестирования производительности, проводимый с целью оценки поведения компонента...]
-    ================================
+=== ПРИМЕР ИДЕАЛЬНОГО ОТВЕТА НА ПОИСК ТЕРМИНА ===
+Привет, мой господин! Информацию о нагрузочном тестировании можно найти в материале "4.1 Лекция №3".
+[NAVIGATE: module-234547]
+[SNIPPET: Нагрузочное тестирование (Performance and Load Testing) – вид тестирования производительности, проводимый с целью оценки поведения компонента...]
+================================
 
-    Фрагменты лекций:
-    {context_str}
+=== ПРИМЕР ИДЕАЛЬНОГО ОТВЕТА НА ОБЩИЙ ВОПРОС ===
+Конечно, мой господин! Рекомендую начать изучение с материала "1.1 Вводная лекция".
+[NAVIGATE: module-123456]
+[SNIPPET: ]
+================================
 
-    Дедлайны:
-    {deadline_str}
-    """
+Фрагменты лекций:
+{context_str}
+
+Дедлайны:
+{deadline_str}
+"""
 
     messages = [{"role": "system", "content": sys_prompt}]
     for h in data.history[-4:]:
@@ -451,10 +466,18 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         target_snippet = snippet_match.group(1).strip()
         reply = re.sub(r'\[SNIPPET:\s*.*?\]', '', reply, flags=re.DOTALL).strip()
 
-    # ИСПРАВЛЕНО: Выдаем ТОЛЬКО ОДНУ кнопку, если есть точная цель. Иначе - предлагаем 3 варианта.
-    unique_targets = []
-    seen_titles = set()
+    # === ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ ИИ (КРОСС-ЧЕК) ===
+    if target_snippet:
+        snippet_clean = re.sub(r'[^\w\s]', '', target_snippet[:60].lower())
+        if snippet_clean:
+            for c in visible_chunks:
+                chunk_clean = re.sub(r'[^\w\s]', '', c.content_text.lower())
+                if snippet_clean in chunk_clean:
+                    target_id = c.moodle_id
+                    target_url = c.url
+                    break
 
+    unique_targets = []
     if target_id:
         for c in visible_chunks:
             if c.moodle_id == target_id:
@@ -465,8 +488,8 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
                     "snippet": target_snippet if target_snippet else ""
                 })
                 break
-    else:
-        # Если ИИ не поставил тег навигации (например, вопрос общий), даем 3 варианта
+    elif search_query != "none":
+        seen_titles = set()
         for c in visible_chunks[:3]:
             clean_title = (c.title or "").strip().lower()
             if clean_title not in seen_titles:
@@ -478,13 +501,12 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
                     "snippet": ""
                 })
 
-    # Корректный вывод дебага по ID чанков
     debug_context = []
     for c in visible_chunks[:5]:
         debug_context.append({
             "title": c.title,
-            "text": c.content_text,
-            "score": round(chunk_scores.get(c.id, 0), 4)  # Используем уникальный c.id
+            "text": c.content_text[:200] + "...",
+            "score": round(chunk_scores.get(c.id, 0), 4)
         })
 
     return {
@@ -493,7 +515,7 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         "target_id": target_id,
         "target_snippet": target_snippet,
         "targets": unique_targets,
-        "expanded_query": search_query,  # Показываем очищенный запрос в логах
+        "expanded_query": search_query,
         "debug_context": debug_context
     }
 
