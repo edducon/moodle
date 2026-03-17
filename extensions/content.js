@@ -494,11 +494,34 @@ function injectChatUI() {
         sessionStorage.setItem(historyKey, messagesArea.innerHTML);
         messagesArea.scrollTop = messagesArea.scrollHeight;
     }
+    let isChatOpen = false;
+    function openChat() {
+        if (isChatOpen) return;
+        isChatOpen = true;
+        chatWindow.classList.add('is-open');
+        btn.classList.add('is-active');
+        setTimeout(() => {
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+            inputField.focus();
+        }, 180);
+    }
 
-    btn.addEventListener('click', () => {
-        chatWindow.style.display = chatWindow.style.display === 'flex' ? 'none' : 'flex';
-        messagesArea.scrollTop = messagesArea.scrollHeight;
-    });
+    function closeChat() {
+        if (!isChatOpen) return;
+        isChatOpen = false;
+
+        chatWindow.classList.remove('is-open');
+        btn.classList.remove('is-active');
+    }
+
+    function toggleChat() {
+        if (isChatOpen) {
+            closeChat();
+        } else {
+            openChat();
+        }
+    }
+    btn.addEventListener('click', toggleChat);
 
     if (!sessionStorage.getItem(welcomeKey)) {
         setTimeout(() => {
