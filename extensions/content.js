@@ -553,12 +553,16 @@ function injectChatUI() {
                 finalHtml += `
                 <details style="margin-top: 8px; font-size: 11px; background: #e9ecef; border-radius: 6px; padding: 5px; border: 1px solid #ced4da;">
                     <summary style="cursor: pointer; color: #495057; font-weight: bold; outline: none;">🔍 Показать источники (Дебаг)</summary>
-                    <div style="margin-top: 5px; max-height: 200px; overflow-y: auto; padding-right: 5px;">`;
+                    <div style="margin-top: 5px; max-height: 250px; overflow-y: auto; padding-right: 5px;">
+                        <div style="margin-bottom: 8px; color: #d63384; font-family: monospace;">
+                            <strong>Expanded Query:</strong> ${data.expanded_query || 'НЕТ ДАННЫХ'}
+                        </div>`;
 
                 data.debug_context.forEach((ctx, idx) => {
                     finalHtml += `
                         <div style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid #dee2e6;">
-                            <strong style="color: #0056b3;">[${idx + 1}] ${ctx.title}</strong><br>
+                            <strong style="color: #0056b3;">[${idx + 1}] ${ctx.title}</strong> 
+                            <span style="color: #198754; font-weight: bold;">(Score: ${ctx.score})</span><br>
                             <span style="color: #6c757d; font-family: monospace;">${ctx.text}</span>
                         </div>`;
                 });
