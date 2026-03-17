@@ -24,5 +24,16 @@
         "js/ui.js"
       ]
     }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "assets/logo.png"
+      ],
+      "matches": [
+        "*://online.mospolytech.ru/*",
+        "*://lms.mospolytech.ru/*"
+      ]
+    }
   ]
 }

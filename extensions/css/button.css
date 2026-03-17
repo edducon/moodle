@@ -1,27 +1,59 @@
 #moodle-bot-btn {
     position: fixed;
-    bottom: 90px;
     right: 20px;
-    width: 60px;
-    height: 60px;
-    background-color: var(--mb-primary);
-    color: #fff;
+    bottom: 85px;
+    width: 68px;
+    height: 68px;
     border-radius: 50%;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    font-size: 28px;
+    background: #ffffff;
+    border: 2px solid #000000;
     cursor: pointer;
     z-index: 999999;
-    box-shadow: 0 4px 10px rgba(0, 123, 255, 0.4);
-    transition: transform 0.2s ease, background-color 0.2s ease;
+    overflow: hidden;
+    box-sizing: border-box;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+    transition: transform 0.2s ease;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
 }
 
 #moodle-bot-btn:hover {
     transform: translateY(-2px);
-    background-color: var(--mb-primary-hover);
 }
 
 #moodle-bot-btn.is-active {
-    transform: scale(0.9);
+    transform: scale(0.95);
+}
+
+#moodle-bot-btn,
+#moodle-bot-btn:hover,
+#moodle-bot-btn:active,
+#moodle-bot-btn:focus,
+#moodle-bot-btn:focus-visible {
+    outline: none !important;
+}
+
+#moodle-bot-btn img {
+    width: 44px;
+    height: 44px;
+    object-fit: contain;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    transform-origin: center center;
+    pointer-events: none;
+}
+
+@keyframes spinClockwiseOnce {
+    from {
+        transform: translate(-50%, -50%) rotate(0deg);
+    }
+    to {
+        transform: translate(-50%, -50%) rotate(360deg);
+    }
+}
+
+#moodle-bot-btn img.spin-once {
+    animation: spinClockwiseOnce 0.7s linear;
 }

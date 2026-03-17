@@ -1,5 +1,13 @@
 window.MoodleBot.activeDeadlines = [];
 
+function spinCircle() {
+    const logo = document.querySelector('#moodle-bot-btn img');
+    if (!logo) return;
+    logo.classList.remove('spin-once');
+    void logo.offsetWidth;
+    logo.classList.add('spin-once');
+}
+
 // === ФУНКЦИИ ДЛЯ ДЕДЛАЙНОВ ===
 function getDaysLeft(date) {
     if (!date) return 0;
@@ -208,9 +216,8 @@ function getHistoryForBackend() {
 function injectChatUI() {
     const btn = document.createElement('div');
     btn.id = 'moodle-bot-btn';
-    btn.innerHTML = '🤖';
+    btn.innerHTML = `<img src="${chrome.runtime.getURL('assets/logo.png')}" alt="Moodle Bot">`;
     document.body.appendChild(btn);
-
     const chatWindow = document.createElement('div');
     chatWindow.id = 'moodle-bot-chat';
 
@@ -253,6 +260,7 @@ function injectChatUI() {
 
     closeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        spinCircle();
         isChatOpen = false;
         chatWindow.classList.remove('is-open');
         btn.classList.remove('is-active');
@@ -260,6 +268,7 @@ function injectChatUI() {
     });
 
     btn.addEventListener('click', () => {
+        spinCircle();
         isChatOpen = !isChatOpen;
         chatWindow.classList.toggle('is-open', isChatOpen);
         btn.classList.toggle('is-active', isChatOpen);
