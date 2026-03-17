@@ -1,6 +1,7 @@
 import os
 import re
 import copy
+import urllib.parse
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -20,22 +21,15 @@ client = OpenAI(base_url=settings.OLLAMA_URL, api_key="ollama")
 embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 
-@app.middleware("http")
-async def custom_cors_middleware(request: Request, call_next):
-    if request.method == "OPTIONS":
-        response = Response(status_code=200)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers[
-            "Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept, Origin, X-Requested-With"
-        response.headers["Access-Control-Allow-Private-Network"] = "true"
-        return response
+from fastapi.middleware.cors import CORSMiddleware
 
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Private-Network"] = "true"
-    return response
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def get_db():
     db = SessionLocal()
@@ -130,20 +124,97 @@ def get_module_format(title: str, mod_type: str, url: str) -> str:
     return "Текстовый материал"
 
 
-def split_text_into_chunks(text: str, chunk_size: int = 1500, overlap: int = 300) -> List[str]:
+def split_text_into_chunks(text: str, min_size: int = 200, max_size: int = 900) -> List[str]:
+    """Умная нарезка текста по абзацам (Semantic Chunking)."""
     if not text:
         return []
-    text = re.sub(r"\s+", " ", text).strip()
-    chunks = []
-    start = 0
-    text_len = len(text)
 
-    while start < text_len:
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
+    # Скрипт Moodle (content.js) присылает нам абзацы, разделенные переносами строк \n
+    paragraphs = re.split(r'\n+', text.strip())
+
+    chunks = []
+    current_chunk = ""
+
+    for p in paragraphs:
+        p = p.strip()
+        if not p or len(p) < 10:  # Игнорируем пустые строки и мусорные огрызки
+            continue
+
+        # Если сам по себе абзац просто гигантский (например, препод забыл нажать Enter)
+        if len(p) > max_size:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            # Режем гиганта кусками (очень редкий случай)
+            start = 0
+            while start < len(p):
+                chunks.append(p[start:start + max_size])
+                start += max_size
+            continue
+
+        # Пытаемся добавить абзац к текущему чанку
+        if len(current_chunk) + len(p) + 1 <= max_size:
+            current_chunk += ("\n" + p if current_chunk else p)
+        else:
+            # Чанк заполнен! Сохраняем его и начинаем новый
+            if len(current_chunk) >= min_size:
+                chunks.append(current_chunk.strip())
+            current_chunk = p
+
+    # Сохраняем последний кусочек, если он остался
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
     return chunks
 
+
+def get_best_snippet(chunk_text: str, query: str) -> str:
+    """Ищет предложение с ключевым словом."""
+    if not chunk_text or not query:
+        return ""
+
+    sentences = re.split(r'(?<=[.!?])\s+', chunk_text)
+    # Сюда уже будет прилетать расширенный запрос с синонимами
+    query_words = set(re.findall(r'[а-яА-Яa-zA-Z0-9]{4,}', query.lower()))
+    stop_words = {"что", "такое", "какой", "какие", "где", "когда", "почему", "зачем", "как", "расскажи", "виды"}
+    keywords = {w for w in query_words if w not in stop_words}
+
+    best_sentence = sentences[0] if sentences else chunk_text
+    max_score = -1
+
+    for s in sentences:
+        s_lower = s.lower()
+        score = 0
+        for kw in keywords:
+            root = kw[:-2] if len(kw) > 5 else kw
+            if root in s_lower:
+                score += 1
+                if re.search(rf'\b{root}[а-яa-z]*\s*[-–—]', s_lower): score += 5
+                if re.search(rf'\b{root}[а-яa-z]*\s+(это|позволяет|является|представляет|означает)', s_lower): score += 4
+                if s_lower.strip().startswith(root): score += 2
+
+        if score > max_score:
+            max_score = score
+            best_sentence = s
+
+    words = best_sentence.split()
+    target_idx = -1
+    for i, w in enumerate(words):
+        w_lower = w.lower()
+        if any(kw[:-2] in w_lower for kw in keywords if len(kw) > 3):
+            target_idx = i
+            break
+
+    # Умный Фолбэк: если слово так и не нашли (например, из-за опечатки "отстутпы"),
+    # но нейросеть уверена, что текст правильный — возвращаем начало абзаца!
+    if target_idx == -1:
+        fallback_snippet = " ".join(sentences[0].split()[:6]) if sentences else " ".join(words[:6])
+        return re.sub(r'\s+', ' ', fallback_snippet).strip()
+
+    start = max(0, target_idx - 2)
+    end = min(len(words), target_idx + 5)
+    snippet = " ".join(words[start:end])
+    return re.sub(r'\s+', ' ', snippet).strip()
 
 # --- API ENDPOINTS ---
 @app.post("/api/course/sync")
@@ -288,16 +359,53 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     user_msg = data.message.strip()
     viewer_role = data.viewer_role or "student"
 
+    # === 1. ГЛОБАЛЬНОЕ РАСШИРЕНИЕ ЗАПРОСА (СИНОНИМЫ) ===
+    query_expanded = user_msg.lower()
+    synonyms = {
+        "лаборатор": "отчет практическ",
+        "лаб": "отчет",
+        "ворд": "word",
+        "пдф": "pdf",
+        "отступ": "форматирование поля интервал шрифт"  # Докинули термины для верности
+    }
+    for k, v in synonyms.items():
+        if k in query_expanded:
+            query_expanded += f" {v}"
+
     query_vector = embedder.encode([user_msg])[0].tolist()
 
-    raw_chunks = db.query(ModuleIndex).filter(
+    # === 2. ГИБРИДНЫЙ ПОИСК И СКОРРИНГ ===
+    distance_col = ModuleIndex.embedding.cosine_distance(query_vector)
+    raw_results = db.query(ModuleIndex, distance_col.label('distance')).filter(
         ModuleIndex.course_id == data.course_id
-    ).order_by(
-        ModuleIndex.embedding.cosine_distance(query_vector)
-    ).limit(15).all()
+    ).order_by(distance_col).limit(100).all()
 
-    visible_chunks = [c for c in raw_chunks if db_module_visible_for_role(c, viewer_role)]
+    stop_words = {"что", "такое", "какой", "какие", "где", "когда", "почему", "зачем", "как", "расскажи", "виды"}
+    # Сортировщик теперь использует расширенный запрос!
+    query_words = set(re.findall(r'[а-яА-Яa-zA-Z0-9]{4,}', query_expanded))
+    keywords = {w for w in query_words if w not in stop_words}
 
+    scored_chunks = []
+    for c, dist in raw_results:
+        text_lower = (c.content_text or "").lower()
+        title_lower = (c.title or "").lower()
+
+        match_bonus = 0
+        for kw in keywords:
+            root = kw[:-2] if len(kw) > 5 else kw
+            # МЕГА-БОНУС: если слово (или синоним) есть в заголовке, лекция взлетает в топ!
+            if root in title_lower:
+                match_bonus += 0.4
+            elif root in text_lower:
+                match_bonus += 0.15
+
+        final_score = dist - match_bonus
+        scored_chunks.append((final_score, c))
+
+    scored_chunks.sort(key=lambda x: x[0])
+    raw_chunks = [c for score, c in scored_chunks]
+
+    # Берем ТОП-5 релевантных материалов (даем нейросети больше контекста)
     context_lines = []
     for c in visible_chunks[:5]:
         mod_format = get_module_format(c.title, c.module_type, c.url)
@@ -309,16 +417,16 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     deadline_lines = [f"- {d.title} (до {d.due_date})" for d in data.deadlines]
     deadline_str = "\n".join(deadline_lines) if deadline_lines else "НЕТ_ДЕДЛАЙНОВ"
 
-    sys_prompt = f"""Ты — СТРОГИЙ БОТ-НАВИГАТОР по образовательному курсу. Твоя ЕДИНСТВЕННАЯ задача — подсказать пользователю, ГДЕ находится нужная ему информация.
+    sys_prompt = f"""Ты — СТРОГИЙ БОТ-НАВИГАТОР по образовательному курсу. Твоя ЕДИНСТВЕННАЯ задача — подсказать пользователю, ГДЕ находится информация.
 
 АБСОЛЮТНЫЕ ПРАВИЛА (НАРУШАТЬ ЗАПРЕЩЕНО):
-1. ЗАПРЕТ НА ОБЪЯСНЕНИЯ: НИКОГДА не объясняй суть терминов! Твой ответ должен быть только навигационным (например: "Теория по этой теме есть в лекции такой-то, а также есть видеолекция").
-2. ПРИОРИТЕТ ТЕКСТА: Если пользователь ищет теорию или материалы, ВСЕГДА используй тег [NAVIGATE: ID_материала] ТОЛЬКО для материалов формата 'Текстовый материал' или 'Папка с файлами'. Про форматы 'Видеолекция' и 'Форум / Обсуждение' просто напиши словами, что они тоже есть в этом разделе, но тег на них не ставь.
-3. ИГНОРИРУЙ ТЕСТЫ И ЗАДАНИЯ ДЛЯ ТЕОРИИ: НИКОГДА не отправляй пользователя (через тег [NAVIGATE: ID_материала]) в 'Тест / Экзамен' или 'Практическое задание', если он ищет теорию или хочет что-то почитать. Направляй туда только если он явно спрашивает про дедлайн, тест или сдачу лабы.
-4. ЗАПРЕТ НА ДОГАДКИ: Ищи совпадения ТОЛЬКО в блоке 'Фрагменты лекций' ниже. Если там нет явного ответа — прямо скажи: "В проиндексированных материалах курса я этого не нашел".
-5. ЗЕРКАЛЬНЫЙ СТИЛЬ: Внимательно проанализируй стиль приветствия пользователя ("Зай", "Привет", официальный). Отвечай в точности в его стиле, но оставайся кратким навигатором. НИКАКИХ системных скобок в ответе.
-6. ДЕДЛАЙНЫ: Если вопрос пользователя — это просто болтовня (smalltalk), поддержи беседу в его стиле и упомяни ближайший дедлайн из блока 'Дедлайны', если он есть.
-7. НАВИГАЦИЯ: Если ты нашел нужный фрагмент (согласно Правилу 2), добавь в самый конец ответа тег: [NAVIGATE: ID_материала].
+1. ЗАПРЕТ НА ОБЪЯСНЕНИЯ И ОПРЕДЕЛЕНИЯ: Если пользователь спрашивает "Что такое X?" или просит объяснить суть, НИКОГДА не пиши само определение! Твой ответ должен быть: "Информацию об этом можно найти в материале [Название материала]". 
+2. ЧИСТОТА ОТВЕТА: Никогда не используй технические идентификаторы (например, module-12345) в тексте сообщения. Только человеческие названия лекций.
+3. ФИЛЬТРАЦИЯ МУСОРА: Игнорируй фрагменты, содержащие технический код, JSON, служебные сообщения (например, "fileexistsdialog", "stacktrace", "renderer"). Если фрагмент — это системная ошибка или код, делай вид, что его не существует.
+4. ПРИОРИТЕТ ТЕКСТА (ТЕГИ): Тег [NAVIGATE: ID_материала] ставь ТОЛЬКО для 'Текстовый материал' или 'Папка с файлами'. Для 'Видеолекция' или 'Форум' просто напиши текстом: "Также есть видеолекция по этой теме".
+5. ЛОГИКА ПОИСКА: Если тема упоминается в 'Фрагментах лекций', ты обязан дать навигационную ссылку. Не говори "не нашел", если слово есть в контексте.
+6. ЗЕРКАЛЬНЫЙ СТИЛЬ: Отвечай в стиле пользователя (официально, дружелюбно или кратко), но не выходи за рамки роли навигатора.
+7. ЕДИНСТВЕННЫЙ ТЕГ: В конце сообщения добавь ровно ОДИН тег [NAVIGATE: ID_материала] для самого релевантного источника, даже если информация размазана по нескольким.
 
 Фрагменты лекций:
 {context_str}
@@ -346,6 +454,7 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
 
     target_id = None
     target_url = None
+    target_snippet = None
 
     nav_match = re.search(r'\[NAVIGATE:\s*(.*?)\]', reply)
     if nav_match:
@@ -355,22 +464,43 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         for c in visible_chunks:
             if c.moodle_id == target_id:
                 target_url = c.url
+                # ИСПРАВЛЕНИЕ 1: Передаем query_expanded, чтобы синонимы работали и здесь!
+                target_snippet = get_best_snippet(c.content_text, query_expanded)
                 break
 
+    # ИСПРАВЛЕНИЕ 2: Сдвинули блок влево (он больше не внутри if nav_match)
+    # === ГЕНЕРАЦИЯ КНОПОК ===
     unique_targets = []
-    seen_ids = set()
-    for c in visible_chunks:
-        if c.moodle_id not in seen_ids:
-            seen_ids.add(c.moodle_id)
-            unique_targets.append({"id": c.moodle_id, "url": c.url, "title": c.title})
+    seen_titles = set()
+
+    for c in visible_chunks[:5]:
+        clean_title = (c.title or "").strip().lower()
+        if clean_title not in seen_titles:
+            seen_titles.add(clean_title)
+            snippet = get_best_snippet(c.content_text, query_expanded)
+
+            unique_targets.append({
+                "id": c.moodle_id,
+                "url": c.url,
+                "title": c.title,
+                "snippet": snippet
+            })
+
+        if len(unique_targets) >= 4:
+            break
+
+    debug_context = []
+    for c in visible_chunks[:3]:
+        debug_context.append({"title": c.title, "text": c.content_text})
 
     return {
         "reply": reply,
         "target_url": target_url,
         "target_id": target_id,
-        "targets": unique_targets[:4]
+        "target_snippet": target_snippet,
+        "targets": unique_targets,
+        "debug_context": debug_context
     }
-
 
 if __name__ == "__main__":
     import uvicorn

@@ -146,27 +146,47 @@ function getModuleType(act) {
 }
 
 function extractMeaningfulContent(doc) {
-    const candidates = [
-        doc.querySelector('[role="main"]'),
-        doc.querySelector('#region-main'),
-        doc.querySelector('.activity-header'),
-        doc.querySelector('.resourcecontent'),
-        doc.querySelector('.box.generalbox'),
-        doc.querySelector('.book_content'),
-        doc.querySelector('.quizinfo'),
-        doc.querySelector('.submissionstatustable'),
-        doc.body
-    ].filter(Boolean);
+    // Ищем самый подходящий контейнер с контентом
+    const mainNode =
+        doc.querySelector('[role="main"]') ||
+        doc.querySelector('#region-main') ||
+        doc.querySelector('.resourcecontent') ||
+        doc.querySelector('.box.generalbox') ||
+        doc.querySelector('.book_content') ||
+        doc.body;
 
-    let bestText = '';
-    for (const node of candidates) {
-        const text = cleanText(node.innerText);
-        if (text.length > bestText.length) {
-            bestText = text;
-        }
-    }
+    if (!mainNode) return '';
 
-    return bestText;
+    // Создаем копию узла, чтобы не сломать верстку на реальной странице пользователя
+    const clone = mainNode.cloneNode(true);
+
+    // Черный список: CSS-селекторы мусора Moodle (чаты, меню, футеры, скрытые элементы)
+    const selectorsToRemove = [
+        '#nav-drawer',                   // Боковое меню
+        '[data-region="drawer"]',        // Выдвижные панели (в т.ч. чат/собеседники)
+        '[data-region="message-drawer"]',// Панель сообщений
+        '.popover-region',               // Уведомления Moodle
+        '#page-footer',                  // Подвал
+        'footer',                        // Тег футера
+        'nav',                           // Меню навигации
+        '.navbar',                       // Верхняя шапка
+        '.block',                        // Боковые информационные блоки
+        '.activity-navigation',          // Кнопки "Следующая/Предыдущая лекция"
+        '.sr-only',                      // Текст для слепых (скринридеров)
+        '.hidden',                       // Скрытые элементы
+        'script',                        // Скрипты
+        'style'                          // Стили
+    ];
+
+    // Удаляем весь мусор из нашей копии страницы
+    selectorsToRemove.forEach(selector => {
+        clone.querySelectorAll(selector).forEach(el => el.remove());
+    });
+
+    // Теперь извлекаем идеально чистый текст
+    let text = clone.innerText || clone.textContent || '';
+
+    return cleanText(text);
 }
 
 function shouldIndexModuleType(type) {
@@ -184,6 +204,24 @@ function shouldIndexModuleType(type) {
         'chat',
         'checklist'
     ].includes(type);
+}
+
+function isFileActivity(act) {
+    if (!act) return false;
+
+    // Проверяем по системной иконке Moodle (f/pdf, f/document, f/powerpoint и т.д.)
+    const icon = act.querySelector('img.icon');
+    if (icon && icon.src) {
+        const src = icon.src.toLowerCase();
+        const fileIcons = ['/f/pdf', '/f/document', '/f/spreadsheet', '/f/powerpoint', '/f/archive', '/f/text', '/f/word', '/f/excel'];
+        if (fileIcons.some(f => src.includes(f))) return true;
+    }
+
+    // Проверяем скрытые метки Moodle для слепых (они часто пишут там слово "Файл")
+    const typeEl = act.querySelector('.accesshide');
+    if (typeEl && typeEl.innerText.toLowerCase().includes('файл')) return true;
+
+    return false;
 }
 
 async function extractDeadlinesFromCourse() {
@@ -336,7 +374,10 @@ function injectChatUI() {
     chatWindow.id = 'moodle-bot-chat';
 
     chatWindow.innerHTML = `
-        <div id="moodle-bot-chat-header">Moodle Assistant</div>
+        <div id="moodle-bot-chat-header" style="display: flex; justify-content: space-between; align-items: center; padding: 10px 15px;">
+            <span>Moodle Assistant</span>
+            <button id="moodle-bot-resize-btn" title="Развернуть" style="background: none; border: none; color: white; cursor: pointer; font-size: 18px; padding: 0; display: flex; align-items: center; justify-content: center; height: 24px; width: 24px; transition: 0.2s;">⛶</button>
+        </div>
         <div id="moodle-bot-chat-messages"></div>
         <div id="moodle-bot-chat-input-area">
             <input type="text" id="moodle-bot-chat-input" placeholder="Введите ваш вопрос...">
@@ -350,6 +391,38 @@ function injectChatUI() {
     const inputField = document.getElementById('moodle-bot-chat-input');
     const historyKey = `moodle_bot_chat_history_${getCourseId()}`;
     const welcomeKey = `moodle_bot_welcome_${getCourseId()}`;
+    const resizeBtn = document.getElementById('moodle-bot-resize-btn');
+
+    // --- НОВАЯ ЛОГИКА: Увеличение размера чата ---
+    let isExpanded = false;
+
+    // Добавляем плавную анимацию для самого окна чата
+    chatWindow.style.transition = 'width 0.3s ease, height 0.3s ease';
+
+    resizeBtn.addEventListener('click', (e) => {
+        e.stopPropagation(); // Чтобы клик не срабатывал на других элементах
+        isExpanded = !isExpanded;
+
+        if (isExpanded) {
+            // Увеличиваем (не на весь экран, но комфортно для чтения)
+            chatWindow.style.width = '600px';
+            chatWindow.style.height = '80vh'; // 80% от высоты экрана
+            resizeBtn.innerHTML = '🗗';        // Меняем иконку на "Свернуть"
+            resizeBtn.title = 'Уменьшить';
+        } else {
+            // Сбрасываем стили (вернутся значения по умолчанию из style.css)
+            chatWindow.style.width = '';
+            chatWindow.style.height = '';
+            resizeBtn.innerHTML = '⛶';        // Возвращаем иконку "Развернуть"
+            resizeBtn.title = 'Развернуть';
+        }
+
+        // Автоматически прокручиваем вниз при изменении размера
+        setTimeout(() => {
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+        }, 310); // Ждем окончания анимации
+    });
+    // ----------------------------------------------
 
     let savedHistory = sessionStorage.getItem(historyKey);
     if (!savedHistory) {
@@ -382,6 +455,12 @@ function injectChatUI() {
 
         const targetUrl = btn.getAttribute('data-url');
         const targetId = btn.getAttribute('data-id');
+        const targetSnippet = btn.getAttribute('data-snippet'); // <--- Читаем текст
+
+        // Сохраняем текст, который нужно будет найти и подсветить
+        if (targetSnippet) {
+            sessionStorage.setItem('moodle_bot_highlight_text', targetSnippet);
+        }
 
         const currentUrlObj = new URL(window.location.href);
         const targetUrlObj = new URL(targetUrl);
@@ -442,17 +521,13 @@ function injectChatUI() {
 
             const data = await response.json();
 
-            if (data.target_url && window.location.href.split('#')[0] !== data.target_url.split('#')[0]) {
-                sessionStorage.setItem('moodle_bot_teleport_msg', data.reply);
-                sessionStorage.setItem('moodle_bot_teleport_target', data.target_id || '');
-                addMessageToChat(`<div class="bot-msg">Нашел! Перехожу к нужному материалу... 🚀</div>`);
-                setTimeout(() => {
-                    window.location.href = data.target_url;
-                }, 1200);
-                return;
-            }
+            // Улучшенное форматирование: переносы, жирный текст и списки
+            let formattedReply = data.reply
+                .replace(/\n/g, '<br>')                   // Возвращаем переносы строк
+                .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')   // Делаем текст жирным
+                .replace(/\* /g, '<br>• ');               // Превращаем звездочки в красивые маркеры списка
 
-            let finalHtml = `<div class="bot-msg">${data.reply}</div>`;
+            let finalHtml = `<div class="bot-msg">${formattedReply}</div>`;
 
             if (data.targets && data.targets.length > 0) {
                 finalHtml += `<div style="margin-top: -5px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px;">`;
@@ -463,6 +538,7 @@ function injectChatUI() {
                         <button class="moodle-bot-target-btn"
                                 data-url="${t.url}"
                                 data-id="${t.id}"
+                                data-snippet="${t.snippet}" 
                                 style="text-align: left; padding: 6px 10px; background: #f8f9fa; border: 1px solid #cce5ff; border-radius: 6px; cursor: pointer; color: #004085; font-size: 12px; transition: 0.2s;">
                             🎯 Переход: ${t.title}
                         </button>
@@ -471,6 +547,25 @@ function injectChatUI() {
 
                 finalHtml += `</div>`;
             }
+
+            // --- ПАНЕЛЬ ОТЛАДКИ (Источники ИИ) ---
+            if (data.debug_context && data.debug_context.length > 0) {
+                finalHtml += `
+                <details style="margin-top: 8px; font-size: 11px; background: #e9ecef; border-radius: 6px; padding: 5px; border: 1px solid #ced4da;">
+                    <summary style="cursor: pointer; color: #495057; font-weight: bold; outline: none;">🔍 Показать источники (Дебаг)</summary>
+                    <div style="margin-top: 5px; max-height: 200px; overflow-y: auto; padding-right: 5px;">`;
+
+                data.debug_context.forEach((ctx, idx) => {
+                    finalHtml += `
+                        <div style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid #dee2e6;">
+                            <strong style="color: #0056b3;">[${idx + 1}] ${ctx.title}</strong><br>
+                            <span style="color: #6c757d; font-family: monospace;">${ctx.text}</span>
+                        </div>`;
+                });
+
+                finalHtml += `</div></details>`;
+            }
+            // ------------------------------------
 
             addMessageToChat(finalHtml);
 
@@ -599,7 +694,8 @@ async function runSilentSpider() {
                     module_type: moduleType,
                     title: extractModuleTitle(act),
                     visibility: extractVisibilityInfo(act),
-                    inline_desc: inlineDescription
+                    inline_desc: inlineDescription,
+                    is_file: isFileActivity(act) // <--- ДОБАВИЛИ ФЛАГ
                 });
             }
         });
@@ -612,19 +708,54 @@ async function runSilentSpider() {
 
         const promises = chunk.map(async (item) => {
             try {
+                // 1. ЕСЛИ ЭТО ФАЙЛ (PDF, Word) - НЕ СКАЧИВАЕМ ЕГО!
+                // Экономим трафик и сразу генерируем SEO-описание
+                if (item.is_file) {
+                    const fileSeoText = `Это прикрепленный учебный материал (документ, файл или презентация) по теме "${item.title}". Обязательно откройте и изучите этот файл, так как он целиком посвящен теме "${item.title}". ${item.inline_desc || ''}`;
+                    return {
+                        moodle_id: item.moodle_id,
+                        title: item.title,
+                        module_type: item.module_type,
+                        content_text: cleanText(fileSeoText),
+                        url: item.href,
+                        visibility: item.visibility
+                    };
+                }
+
+                // 2. ЕСЛИ ЭТО СТРАНИЦА - ИДЕМ ЧИТАТЬ ЕЁ
                 const response = await fetch(item.href, { credentials: 'include' });
+
+                // Защита №2: Если сервер подсунул нам файл без иконки (проверяем заголовки ДО скачивания тела)
+                const contentType = response.headers.get('content-type');
+                if (contentType && !contentType.includes('text/html')) {
+                    const fileSeoText = `Это загружаемый файл по теме "${item.title}". Он предназначен для изучения темы "${item.title}". ${item.inline_desc || ''}`;
+                    return {
+                        moodle_id: item.moodle_id,
+                        title: item.title,
+                        module_type: item.module_type,
+                        content_text: cleanText(fileSeoText),
+                        url: item.href,
+                        visibility: item.visibility
+                    };
+                }
+
+                // Читаем текст страницы
                 const html = await response.text();
                 const doc = new DOMParser().parseFromString(html, "text/html");
-
                 let text = extractMeaningfulContent(doc);
 
                 if (item.inline_desc) {
                     text = item.inline_desc + "\n" + text;
                 }
 
+                // 3. УМНОЕ ОБОГАЩЕНИЕ МЕДИА-КОНТЕНТА (Видео, короткие ссылки)
                 if (!text || text.length < 80) {
-                    const pageTitle = cleanText(doc.title);
-                    text = cleanText(`${item.title} ${pageTitle} ${text}`);
+                    const hasVideo = doc.querySelector('iframe, video, .mediaplugin');
+                    if (hasVideo || item.title.toLowerCase().includes('видео')) {
+                        text = cleanText(`Это обучающая видеолекция по теме "${item.title}". Данный медиаматериал целиком и полностью посвящен изучению темы "${item.title}". Обязательно посмотрите это видео, чтобы понять ${item.title}. ${item.inline_desc || ''}`);
+                    } else {
+                        text = cleanText(`Это практический материал или важная ссылка по теме "${item.title}". Относится к разделу ${item.title}. ${item.inline_desc || ''}`);
+                    }
                 }
 
                 if (!text) return null;
@@ -693,6 +824,67 @@ async function passiveModuleSync() {
 // === ТОЧКА ВХОДА ===
 setTimeout(async () => {
     injectChatUI();
+
+    // --- НОВЫЙ БЛОК: NOTION-STYLE ПОДСВЕТКА АБЗАЦЕВ ---
+    const textToHighlight = sessionStorage.getItem('moodle_bot_highlight_text');
+    if (textToHighlight) {
+        sessionStorage.removeItem('moodle_bot_highlight_text');
+
+        // Внедряем красивые стили для анимации (Пульсация с левой рамкой)
+        if (!document.getElementById('bot-highlight-styles')) {
+            const style = document.createElement('style');
+            style.id = 'bot-highlight-styles';
+            style.innerHTML = `
+                @keyframes botPulse {
+                    0% { background-color: rgba(255, 193, 7, 0.1); border-left: 4px solid transparent; }
+                    20% { background-color: rgba(255, 193, 7, 0.3); border-left: 4px solid #ffc107; transform: translateX(3px); }
+                    80% { background-color: rgba(255, 193, 7, 0.3); border-left: 4px solid #ffc107; transform: translateX(0); }
+                    100% { background-color: transparent; border-left: 4px solid transparent; }
+                }
+                .bot-highlight-animation {
+                    animation: botPulse 4s ease-in-out !important;
+                    border-radius: 2px;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        setTimeout(() => {
+            const mainContent = document.querySelector('[role="main"]') || document.querySelector('#region-main') || document.body;
+
+            // Устанавливаем курсор браузера в начало контента лекции
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            const range = document.createRange();
+            range.selectNodeContents(mainContent);
+            range.collapse(true);
+            sel.addRange(range);
+
+            if (window.find(textToHighlight)) {
+                const foundRange = sel.getRangeAt(0);
+                let node = foundRange.commonAncestorContainer;
+
+                // Поднимаемся от текста до родительского блочного элемента (p, li, div)
+                if (node.nodeType === 3) node = node.parentNode;
+                while (node && (node.tagName === 'B' || node.tagName === 'STRONG' || node.tagName === 'SPAN' || node.tagName === 'I' || node.tagName === 'A')) {
+                    node = node.parentNode;
+                }
+
+                // Исключаем случайное выделение всей страницы
+                const forbiddenTags = ['BODY', 'MAIN', 'HTML', 'SECTION'];
+                if (node && !forbiddenTags.includes(node.tagName)) {
+                    node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    node.classList.add('bot-highlight-animation');
+
+                    setTimeout(() => node.classList.remove('bot-highlight-animation'), 4000);
+                }
+                sel.removeAllRanges(); // Снимаем синее выделение браузера
+            } else {
+                console.log("[Moodle Bot] Фрагмент не найден на странице:", textToHighlight);
+            }
+        }, 800);
+    }
+    // --- КОНЕЦ НОВОГО БЛОКА ---
 
     const path = window.location.pathname;
     const isTeacher = isTeacherView();
