@@ -281,6 +281,20 @@ function buildDeadlineLabel(date) {
 
 const minimizedDeadlines = [];
 
+function animateDeadlineHide(bubble, mode = 'close', callback) {
+    if (!bubble) return;
+    bubble.classList.remove('is-hiding', 'is-minimizing');
+    if (mode === 'minimize') {
+        bubble.classList.add('is-minimizing');
+    } else {
+        bubble.classList.add('is-hiding');
+    }
+    setTimeout(() => {
+        bubble.remove();
+        if (typeof callback === 'function') callback();
+    }, 300);
+}
+
 function showDeadlineNotification(deadline) {
     if (!deadline) return;
 
@@ -302,13 +316,14 @@ function showDeadlineNotification(deadline) {
 
     bubble.querySelector('.moodle-deadline-open')?.addEventListener('click', () => window.open(deadline.url, '_blank'));
     bubble.querySelector('.moodle-deadline-minimize')?.addEventListener('click', () => {
-        bubble.style.display = 'none';
+        animateDeadlineHide(bubble, 'minimize', () => {
         minimizedDeadlines.push(deadline);
         updateMinimizedChatButton();
+        });
     });
     bubble.querySelector('.moodle-deadline-close')?.addEventListener('click', () => {
         localStorage.setItem(storageKey, new Date().toLocaleDateString('ru-RU'));
-        bubble.remove();
+        animateDeadlineHide(bubble, 'close');
     });
 }
 
@@ -319,9 +334,12 @@ function updateMinimizedChatButton() {
         btn.innerHTML = `<video src="https://cdn-icons-mp4.flaticon.com/512/11919/11919421.mp4" autoplay loop muted playsinline style="width:40px; border-radius:50%"></video>`;
         document.body.appendChild(btn);
         btn.addEventListener('click', () => {
-            minimizedDeadlines.forEach(showDeadlineNotification);
+            const items = [...minimizedDeadlines];
             minimizedDeadlines.length = 0;
             btn.remove();
+            items.forEach((item, index) => {
+                setTimeout(() => showDeadlineNotification(item), index * 120);
+            });
         });
     }
 }
