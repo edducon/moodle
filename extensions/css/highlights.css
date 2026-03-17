@@ -1,0 +1,11 @@
+@keyframes botPulse {
+    0% { box-shadow: 0 0 0 0 rgba(20, 136, 255, 0.35); background-color: rgba(20, 200, 196, 0.04); }
+    70% { box-shadow: 0 0 0 14px rgba(20, 136, 255, 0); background-color: rgba(20, 200, 196, 0.12); }
+    100% { box-shadow: 0 0 0 0 rgba(20, 136, 255, 0); background-color: rgba(20, 200, 196, 0.04); }
+}
+
+.bot-highlight-animation {
+    animation: botPulse 1.5s infinite;
+    border-radius: 16px;
+    border: 1.5px solid rgba(20, 136, 255, 0.35) !important;
+}

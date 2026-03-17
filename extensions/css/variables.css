@@ -1,0 +1,14 @@
+:root {
+    --mb-primary: #007bff;        /* Фирменный синий Moodle */
+    --mb-primary-hover: #0056b3;
+    --mb-header-bg: #343a40;      /* Темно-серый как верхняя панель Политеха */
+    --mb-bg: #f8f9fa;             /* Светло-серый фон сайта */
+    --mb-panel: #ffffff;          /* Белый фон окон */
+    --mb-text: #212529;           /* Стандартный текст Bootstrap */
+    --mb-text-soft: #6c757d;
+    --mb-border: #dee2e6;         /* Стандартные границы Moodle */
+    --mb-msg-bot: #f1f3f5;        /* Фон сообщения бота */
+    --mb-shadow: 0 4px 15px rgba(0, 0, 0, 0.15);
+    --mb-radius-lg: 8px;          /* Строгие скругления */
+    --mb-radius-md: 6px;
+}

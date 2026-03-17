@@ -1,0 +1,27 @@
+#moodle-bot-btn {
+    position: fixed;
+    bottom: 90px;
+    right: 20px;
+    width: 60px;
+    height: 60px;
+    background-color: var(--mb-primary);
+    color: #fff;
+    border-radius: 50%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-size: 28px;
+    cursor: pointer;
+    z-index: 999999;
+    box-shadow: 0 4px 10px rgba(0, 123, 255, 0.4);
+    transition: transform 0.2s ease, background-color 0.2s ease;
+}
+
+#moodle-bot-btn:hover {
+    transform: translateY(-2px);
+    background-color: var(--mb-primary-hover);
+}
+
+#moodle-bot-btn.is-active {
+    transform: scale(0.9);
+}

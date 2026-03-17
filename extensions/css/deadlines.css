@@ -1,0 +1,142 @@
+#moodle-deadlines-widget {
+    position: fixed;
+    bottom: 170px; /* Прямо под шапкой сайта */
+    right: 20px;
+    width: 320px;
+    background: var(--mb-panel);
+    border: 1px solid var(--mb-border);
+    border-radius: var(--mb-radius-lg);
+    box-shadow: var(--mb-shadow);
+    z-index: 99999;
+    font-family: Arial, sans-serif;
+    overflow: hidden;
+    transition: width 0.3s ease, border-radius 0.3s ease;
+}
+
+/* Свернутый режим (кнопка-таблетка) */
+#moodle-deadlines-widget.is-collapsed {
+    width: auto;
+    border-radius: 30px;
+}
+
+#moodle-deadlines-header {
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    background: var(--mb-header-bg);
+    color: #fff;
+    gap: 10px;
+    cursor: pointer;
+    user-select: none;
+    transition: padding 0.3s ease;
+}
+
+#moodle-deadlines-widget.is-collapsed #moodle-deadlines-header {
+    padding: 8px 14px;
+}
+
+.md-icon { font-size: 16px; }
+.md-title { font-weight: bold; font-size: 14px; white-space: nowrap; }
+
+.md-badge {
+    background: #dc3545; /* Красный цвет для важности */
+    color: #fff;
+    font-size: 12px;
+    font-weight: bold;
+    padding: 2px 8px;
+    border-radius: 12px;
+}
+
+.md-toggle-btn {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: #adb5bd;
+    font-size: 12px;
+    cursor: pointer;
+    transition: color 0.2s ease;
+}
+
+#moodle-deadlines-header:hover .md-toggle-btn {
+    color: #fff;
+}
+
+#moodle-deadlines-widget.is-collapsed .md-toggle-btn,
+#moodle-deadlines-widget.is-collapsed .md-title {
+    display: none; /* Прячем текст и стрелку, оставляем только иконку и счетчик */
+}
+
+#moodle-deadlines-body {
+    max-height: 350px;
+    overflow-y: auto;
+    background: var(--mb-bg);
+}
+
+#moodle-deadlines-widget.is-collapsed #moodle-deadlines-body {
+    display: none;
+}
+
+.md-item {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--mb-border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: #fff;
+}
+
+.md-item:last-child {
+    border-bottom: none;
+}
+
+.md-item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.md-item-name {
+    font-size: 13px;
+    font-weight: bold;
+    color: var(--mb-text);
+    line-height: 1.3;
+}
+
+/* Цветовая индикация дедлайнов */
+.md-item-time {
+    font-size: 11px;
+    font-weight: bold;
+    padding: 3px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+.md-item-time.danger { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+.md-item-time.warning { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+.md-item-time.safe { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+
+.md-item-date {
+    font-size: 11px;
+    color: var(--mb-text-soft);
+}
+
+.md-item-btn {
+    display: block;
+    text-align: center;
+    background: #fff;
+    border: 1px solid var(--mb-primary);
+    color: var(--mb-primary);
+    text-decoration: none;
+    font-size: 12px;
+    font-weight: bold;
+    padding: 6px;
+    border-radius: var(--mb-radius-md);
+    transition: 0.2s;
+    margin-top: 4px;
+}
+
+.md-item-btn:hover {
+    background: var(--mb-primary);
+    color: #fff;
+    text-decoration: none;
+}

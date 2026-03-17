@@ -1,0 +1,162 @@
+#moodle-bot-chat {
+    position: fixed;
+    bottom: 170px;
+    right: 20px;
+    width: 380px;
+    height: 560px;
+    background: var(--mb-panel);
+    border-radius: var(--mb-radius-lg);
+    box-shadow: var(--mb-shadow);
+    z-index: 999999;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    font-family: Arial, sans-serif;
+    border: 1px solid var(--mb-border);
+    transform-origin: bottom right;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(20px) scale(0.95);
+    transition: all 0.25s ease;
+}
+
+#moodle-bot-chat.expanded {
+    width: 600px !important;
+    height: 80vh !important;
+}
+
+#moodle-bot-chat.is-open {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0) scale(1);
+}
+
+#moodle-bot-chat-header {
+    background-color: var(--mb-header-bg);
+    color: #fff;
+    padding: 12px 16px;
+    display: flex;
+    justify-content: space-between; /* Раскидываем текст и кнопки по краям */
+    align-items: center;
+    font-weight: bold;
+    font-size: 15px;
+}
+
+.moodle-bot-header-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}
+
+.moodle-bot-header-actions button {
+    background: none;
+    border: none;
+    color: #adb5bd;
+    cursor: pointer;
+    font-size: 18px;
+    padding: 0;
+    line-height: 1;
+    transition: color 0.2s;
+}
+
+.moodle-bot-header-actions button:hover {
+    color: #fff;
+}
+
+#moodle-bot-chat-messages {
+    flex-grow: 1;
+    padding: 16px;
+    overflow-y: auto;
+    background-color: var(--mb-bg);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+#moodle-bot-chat-input-area {
+    display: flex;
+    gap: 10px;
+    padding: 12px;
+    background: var(--mb-panel);
+    border-top: 1px solid var(--mb-border);
+}
+
+#moodle-bot-chat-input {
+    flex-grow: 1;
+    height: 40px;
+    padding: 0 14px;
+    border: 1px solid var(--mb-border);
+    border-radius: var(--mb-radius-md);
+    outline: none;
+    font-size: 14px;
+    color: var(--mb-text);
+}
+
+#moodle-bot-chat-input:focus {
+    border-color: var(--mb-primary);
+    box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
+}
+
+#moodle-bot-chat-send {
+    width: 44px;
+    height: 40px;
+    border: none;
+    border-radius: var(--mb-radius-md);
+    background-color: var(--mb-primary);
+    color: #fff;
+    cursor: pointer;
+    font-size: 16px;
+    transition: background-color 0.2s;
+}
+
+#moodle-bot-chat-send:hover {
+    background-color: var(--mb-primary-hover);
+}
+
+.bot-msg, .user-msg {
+    padding: 10px 14px;
+    border-radius: var(--mb-radius-md);
+    max-width: 85%;
+    width: fit-content;
+    line-height: 1.4;
+    font-size: 14px;
+}
+
+.bot-msg {
+    align-self: flex-start;
+    color: var(--mb-text);
+    background: var(--mb-msg-bot);
+    border: 1px solid var(--mb-border);
+}
+
+.user-msg {
+    align-self: flex-end;
+    color: #fff;
+    background-color: var(--mb-primary);
+}
+
+.moodle-bot-target-btn {
+    text-align: left;
+    padding: 8px 12px;
+    background: #fff;
+    border: 1px solid var(--mb-primary);
+    border-radius: var(--mb-radius-md);
+    cursor: pointer;
+    color: var(--mb-primary);
+    font-size: 13px;
+    font-weight: bold;
+    transition: 0.2s;
+    margin-top: 4px;
+}
+
+.moodle-bot-target-btn:hover {
+    background: var(--mb-primary);
+    color: #fff;
+}
+
+/* Дебаг панель */
+.moodle-debug-panel { margin-top: 8px; font-size: 11px; background: #e9ecef; border-radius: 4px; padding: 8px; border: 1px solid var(--mb-border); }
+.moodle-debug-query { margin-bottom: 8px; color: #dc3545; font-family: monospace; }
+.moodle-debug-item { margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--mb-border); }
+.moodle-debug-item span { color: #198754; font-weight: bold; }
+.moodle-debug-item p { color: #6c757d; font-family: monospace; margin: 2px 0 0 0; }

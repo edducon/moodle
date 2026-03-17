@@ -1,14 +1,28 @@
 {
   "manifest_version": 3,
-  "name": "Moodle Smart Assistant",
+  "name": "Moodle AI Assistant",
   "version": "0.1",
-  "description": "Умный помощник для навигации по курсам Moodle",
+  "description": "AI-помощник для навигации по курсам Moodle",
+  "permissions": [
+    "activeTab",
+    "storage"
+  ],
   "content_scripts": [
     {
       "matches": ["*://online.mospolytech.ru/*",
                   "*://lms.mospolytech.ru/*"],
-      "css": ["style.css"],
-      "js": ["content.js"]
+      "css": [
+        "css/variables.css",
+        "css/button.css",
+        "css/chat.css",
+        "css/deadlines.css",
+        "css/highlights.css"
+      ],
+      "js": [
+        "js/utils.js",
+        "js/api.js",
+        "js/ui.js"
+      ]
     }
   ]
 }
