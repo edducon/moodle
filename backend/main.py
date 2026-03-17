@@ -359,20 +359,49 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     user_msg = data.message.strip()
     viewer_role = data.viewer_role or "student"
 
-    # === 1. ГЛОБАЛЬНОЕ РАСШИРЕНИЕ ЗАПРОСА (СИНОНИМЫ) ===
+    # === 1. СМЕШАННОЕ РАСШИРЕНИЕ ЗАПРОСА ===
     query_expanded = user_msg.lower()
+
+    # А) Сначала надежный хардкод для сленга (100% точность без галлюцинаций)
     synonyms = {
         "лаборатор": "отчет практическ",
         "лаб": "отчет",
         "ворд": "word",
-        "пдф": "pdf",
-        "отступ": "форматирование поля интервал шрифт"  # Докинули термины для верности
+        "отступ": "форматирование оформление"
     }
     for k, v in synonyms.items():
         if k in query_expanded:
             query_expanded += f" {v}"
 
-    query_vector = embedder.encode([user_msg])[0].tolist()
+    # Б) Стерильный промпт для LLM: просим только вытащить суть (никаких примеров!)
+    expansion_prompt = f"""Извлеки из текста только самые важные ключевые слова для поиска. 
+    Отвечай строго только словами через пробел. Никаких предложений.
+    Текст: {query_expanded}
+    Ключевые слова:"""
+
+    try:
+        expansion_response = client.chat.completions.create(
+            model=settings.LLM_MODEL,
+            messages=[{"role": "user", "content": expansion_prompt}],
+            temperature=0.0,
+            max_tokens=20
+        )
+        llm_words = expansion_response.choices[0].message.content.strip().lower()
+        llm_words = re.sub(r'[^\w\s]', '', llm_words)  # Убиваем пунктуацию
+
+        # === ИСПРАВЛЕНИЕ ===
+        # Выбираем только те слова от ИИ, которых еще нет в запросе
+        unique_llm_words = [w for w in llm_words.split() if w not in query_expanded]
+        # Аккуратно приклеиваем их в конец, НЕ ломая порядок оригинального предложения!
+        query_expanded = f"{query_expanded} {' '.join(unique_llm_words)}".strip()
+
+    except Exception as e:
+        print(f"🚨 Ошибка LLM при расширении запроса: {e}")
+
+    print(f"🧠 [Query Expansion] Было: '{user_msg}' -> Стало: '{query_expanded}'")
+
+    # Кодируем в вектор уже РАСШИРЕННЫЙ запрос (это кардинально сблизит векторы!)
+    query_vector = embedder.encode([query_expanded])[0].tolist()
 
     # === 2. ГИБРИДНЫЙ ПОИСК И СКОРРИНГ ===
     distance_col = ModuleIndex.embedding.cosine_distance(query_vector)
@@ -381,7 +410,8 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     ).order_by(distance_col).limit(100).all()
 
     stop_words = {"что", "такое", "какой", "какие", "где", "когда", "почему", "зачем", "как", "расскажи", "виды"}
-    # Сортировщик теперь использует расширенный запрос!
+
+    # Сортировщик и Маркер используют расширенный словарь от нейросети!
     query_words = set(re.findall(r'[а-яА-Яa-zA-Z0-9]{4,}', query_expanded))
     keywords = {w for w in query_words if w not in stop_words}
 
@@ -393,18 +423,32 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         match_bonus = 0
         for kw in keywords:
             root = kw[:-2] if len(kw) > 5 else kw
-            # МЕГА-БОНУС: если слово (или синоним) есть в заголовке, лекция взлетает в топ!
-            if root in title_lower:
-                match_bonus += 0.4
-            elif root in text_lower:
-                match_bonus += 0.15
 
+            # Бонус за заголовок даем только ТЕОРИИ, тестам (quiz) это запрещено!
+            if root in title_lower and c.module_type != 'quiz':
+                match_bonus += 0.2
+
+            if root in text_lower:
+                match_bonus += 0.05
+
+                # ГЛОБАЛЬНЫЙ ДЕТЕКТОР ОПРЕДЕЛЕНИЙ:
+                # Разрешаем до 40 символов между словом и тире (чтобы пропустить английские переводы в скобках)
+                if re.search(rf'\b{root}[а-яa-z]*\b.{{0,40}}?[-–—]', text_lower) or \
+                        re.search(rf'\b{root}[а-яa-z]*\b.{{0,40}}?(это|позволяет|является|представляет|означает)',
+                                  text_lower):
+                    match_bonus += 0.35  # Джекпот! Выкидываем этот кусок на самый верх
         final_score = dist - match_bonus
+
+        # Пессимизация (штраф): Опускаем тесты на дно поисковой выдачи
+        if c.module_type == 'quiz':
+            final_score += 0.25
+
         scored_chunks.append((final_score, c))
 
     scored_chunks.sort(key=lambda x: x[0])
     raw_chunks = [c for score, c in scored_chunks]
-
+    chunk_scores = {c.moodle_id: score for score, c in scored_chunks}
+    visible_chunks = [c for c in raw_chunks if db_module_visible_for_role(c, viewer_role)]
     # Берем ТОП-5 релевантных материалов (даем нейросети больше контекста)
     context_lines = []
     for c in visible_chunks[:5]:
@@ -489,9 +533,22 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         if len(unique_targets) >= 4:
             break
 
+    # === ИСПРАВЛЕНИЕ: ПЕРЕНОС ГЛАВНОЙ КНОПКИ ИИ НАВЕРХ ===
+    if target_id:
+        # Ищем индекс кнопки, которую выбрала нейросеть
+        target_btn_index = next((i for i, t in enumerate(unique_targets) if t["id"] == target_id), -1)
+        if target_btn_index != -1:
+            # Вырезаем её из списка и вставляем на самое 0-е место!
+            target_btn = unique_targets.pop(target_btn_index)
+            unique_targets.insert(0, target_btn)
+
     debug_context = []
-    for c in visible_chunks[:3]:
-        debug_context.append({"title": c.title, "text": c.content_text})
+    for c in visible_chunks[:5]:
+        debug_context.append({
+            "title": c.title,
+            "text": c.content_text,
+            "score": round(chunk_scores.get(c.moodle_id, 0), 4)  # Добавили балл
+        })
 
     return {
         "reply": reply,
@@ -499,6 +556,7 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         "target_id": target_id,
         "target_snippet": target_snippet,
         "targets": unique_targets,
+        "expanded_query": query_expanded,  # Прокидываем расширенный запрос
         "debug_context": debug_context
     }
 
