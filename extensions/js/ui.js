@@ -25,32 +25,44 @@ function buildDeadlineLabel(daysLeft) {
 
 async function extractDeadlinesFromCourse() {
     const doms = await getCourseDOMs();
-    const deadlines = [];
+    const assignments = [];
     const seenAssigns = new Set();
 
+    // 1. Быстро собираем все ссылки на задания
     for (const doc of doms) {
-        const assignments = doc.querySelectorAll('li.activity.modtype_assign');
-        for (const act of assignments) {
+        const assigns = doc.querySelectorAll('li.activity.modtype_assign');
+        for (const act of assigns) {
             if (isActivityHidden(act) || seenAssigns.has(act.id)) continue;
             seenAssigns.add(act.id);
             const a = act.querySelector('a.aalink');
-            if (!a) continue;
+            if (a) assignments.push({ id: act.id, title: extractModuleTitle(act), url: a.href });
+        }
+    }
 
+    const deadlines = [];
+
+    // 2. Асинхронно скачиваем страницы пачками по 4 штуки (ускорение в 4 раза!)
+    for (let i = 0; i < assignments.length; i += 4) {
+        const chunk = assignments.slice(i, i + 4);
+        const promises = chunk.map(async (assign) => {
             try {
-                const response = await fetch(a.href, { credentials: 'include' });
-                const assignDoc = new DOMParser().parseFromString(await response.text(), "text/html");
+                const response = await fetch(assign.url, { credentials: 'include' });
+                const html = await response.text();
+                const assignDoc = new DOMParser().parseFromString(html, "text/html");
+
                 const statusEl = assignDoc.querySelector('.submissionstatus, .submissionstatussubmitted, .badge-success');
-                if (statusEl && /выполнено|отправлено|submitted/i.test(statusEl.innerText)) continue;
+                if (statusEl && /выполнено|отправлено|submitted/i.test(statusEl.innerText)) return;
 
                 const dueTextMatch = assignDoc.body.innerText.match(/Срок сдачи:\s*(?:[а-яё]+,\s*)?(\d{1,2}\s+[а-яё]+ \d{4})/i);
                 if (dueTextMatch && dueTextMatch[1]) {
                     const dueDate = parseRuDate(dueTextMatch[1]);
                     if (dueDate) {
-                        deadlines.push({ title: a.innerText.trim(), due_date: dueDate, url: a.href, moodle_id: act.id });
+                        deadlines.push({ title: assign.title, due_date: dueDate, url: assign.url, moodle_id: assign.id });
                     }
                 }
             } catch (e) {}
-        }
+        });
+        await Promise.all(promises);
     }
 
     const formattedDeadlines = deadlines.map(d => ({
@@ -62,6 +74,84 @@ async function extractDeadlinesFromCourse() {
 
     window.MoodleBot.activeDeadlines = formattedDeadlines;
     return formattedDeadlines;
+}
+
+function renderUngradedWidget(ungradedList) {
+    let widget = document.getElementById('moodle-deadlines-widget');
+    if (widget) widget.remove();
+
+    widget = document.createElement('div');
+    widget.id = 'moodle-deadlines-widget';
+
+    const storageKey = `moodle_ungraded_state_${getCourseId()}`;
+    const isCollapsed = sessionStorage.getItem(storageKey) === 'collapsed';
+    if (isCollapsed) {
+        widget.classList.add('is-collapsed');
+    }
+
+    const header = document.createElement('div');
+    header.id = 'moodle-deadlines-header';
+    header.title = "Нажмите, чтобы развернуть/свернуть";
+
+    const totalCount = (ungradedList || []).reduce((sum, item) => sum + item.count, 0);
+
+    const badgeHtml = totalCount > 0
+        ? `<span style="position: absolute; top: -6px; right: -8px; background: #dc3545; color: white; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 10px; line-height: 1; border: 2px solid #343a40; z-index: 2;" title="Ждут проверки">${totalCount}</span>`
+        : `<span style="position: absolute; top: -4px; right: -6px; background: #28a745; color: white; font-size: 9px; font-weight: bold; padding: 2px 4px; border-radius: 10px; line-height: 1; border: 2px solid #343a40; z-index: 2;" title="Всё проверено">✓</span>`;
+
+    // Кнопка обновления в шапке (прячется, если виджет свернут)
+    header.innerHTML = `
+        <div style="position: relative; display: inline-flex; align-items: center; justify-content: center; margin-right: 12px; margin-left: 5px;">
+            <span class="md-icon" style="margin-right: 0; font-size: 16px;">📝</span>
+            ${badgeHtml}
+        </div>
+        <span class="md-title" style="flex-grow: 1;">Требуют оценки</span>
+        <button class="md-refresh-btn" title="Принудительно обновить" style="margin-left: 10px; margin-right: 5px; background: none; border: none; cursor: pointer; font-size: 14px; display: ${isCollapsed ? 'none' : 'inline-block'}; transition: opacity 0.2s;">🔄</button>
+        <button class="md-toggle-btn">${isCollapsed ? '◀' : '▼'}</button>
+    `;
+
+    const body = document.createElement('div');
+    body.id = 'moodle-deadlines-body';
+
+    if (!ungradedList || ungradedList.length === 0) {
+        const emptyItem = document.createElement('div');
+        emptyItem.className = 'md-item';
+        emptyItem.innerHTML = `<div class="md-item-name" style="text-align: center; color: #28a745; padding: 10px 0;">🎉 Все работы проверены!</div>`;
+        body.appendChild(emptyItem);
+    } else {
+        ungradedList.forEach(item => {
+            const el = document.createElement('div');
+            el.className = 'md-item';
+            el.innerHTML = `
+                <div class="md-item-header">
+                    <div class="md-item-name">${item.title}</div>
+                    <div class="md-item-time danger" style="font-weight: bold;">+${item.count} шт.</div>
+                </div>
+                <a href="${item.url}" target="_blank" class="md-item-btn" style="background-color: #198754; color: white;">Оценить работы</a>
+            `;
+            body.appendChild(el);
+        });
+    }
+
+    widget.appendChild(header);
+    widget.appendChild(body);
+    document.body.appendChild(widget);
+
+    header.addEventListener('click', (e) => {
+        // Если кликнули по кнопке обновления — панель не сворачиваем
+        if (e.target.closest('.md-refresh-btn')) return;
+
+        widget.classList.toggle('is-collapsed');
+        const nowCollapsed = widget.classList.contains('is-collapsed');
+        sessionStorage.setItem(storageKey, nowCollapsed ? 'collapsed' : 'expanded');
+
+        const toggleBtn = header.querySelector('.md-toggle-btn');
+        toggleBtn.innerHTML = nowCollapsed ? '◀' : '▼';
+
+        // Прячем или показываем кнопку обновления
+        const refreshBtn = header.querySelector('.md-refresh-btn');
+        if (refreshBtn) refreshBtn.style.display = nowCollapsed ? 'none' : 'inline-block';
+    });
 }
 
 function renderDeadlinesWidget(deadlines) {
@@ -77,7 +167,8 @@ function renderDeadlinesWidget(deadlines) {
     widget.id = 'moodle-deadlines-widget';
 
     const storageKey = `moodle_deadlines_state_${getCourseId()}`;
-    if (sessionStorage.getItem(storageKey) === 'collapsed') {
+    const isCollapsed = sessionStorage.getItem(storageKey) === 'collapsed';
+    if (isCollapsed) {
         widget.classList.add('is-collapsed');
     }
 
@@ -86,14 +177,18 @@ function renderDeadlinesWidget(deadlines) {
     header.title = "Нажмите, чтобы развернуть/свернуть";
 
     const badgeHtml = processed.length > 0
-        ? `<span class="md-badge" title="Ожидают сдачи">${processed.length}</span>`
-        : `<span class="md-badge" style="background:#28a745;" title="Всё сдано">✓</span>`;
+        ? `<span style="position: absolute; top: -6px; right: -8px; background: #dc3545; color: white; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 10px; line-height: 1; border: 2px solid #343a40; z-index: 2;" title="Ожидают сдачи">${processed.length}</span>`
+        : `<span style="position: absolute; top: -4px; right: -6px; background: #28a745; color: white; font-size: 9px; font-weight: bold; padding: 2px 4px; border-radius: 10px; line-height: 1; border: 2px solid #343a40; z-index: 2;" title="Всё сдано">✓</span>`;
 
+    // Кнопка обновления в шапке (прячется, если виджет свернут)
     header.innerHTML = `
-        <span class="md-icon">📅</span>
-        <span class="md-title">Задания и Дедлайны</span>
-        ${badgeHtml}
-        <button class="md-toggle-btn">${widget.classList.contains('is-collapsed') ? '◀' : '▼'}</button>
+        <div style="position: relative; display: inline-flex; align-items: center; justify-content: center; margin-right: 12px; margin-left: 5px;">
+            <span class="md-icon" style="margin-right: 0; font-size: 16px;">📅</span>
+            ${badgeHtml}
+        </div>
+        <span class="md-title" style="flex-grow: 1;">Задания и Дедлайны</span>
+        <button class="md-refresh-btn" title="Принудительно обновить" style="margin-left: 10px; margin-right: 5px; background: none; border: none; cursor: pointer; font-size: 14px; display: ${isCollapsed ? 'none' : 'inline-block'}; transition: opacity 0.2s;">🔄</button>
+        <button class="md-toggle-btn">${isCollapsed ? '◀' : '▼'}</button>
     `;
 
     const body = document.createElement('div');
@@ -130,19 +225,21 @@ function renderDeadlinesWidget(deadlines) {
     widget.appendChild(body);
     document.body.appendChild(widget);
 
-    header.addEventListener('click', () => {
-        widget.classList.toggle('is-collapsed');
-        sessionStorage.setItem(storageKey, widget.classList.contains('is-collapsed') ? 'collapsed' : 'expanded');
-        const btn = header.querySelector('.md-toggle-btn');
-        btn.innerHTML = widget.classList.contains('is-collapsed') ? '◀' : '▼';
-    });
-}
+    header.addEventListener('click', (e) => {
+        // Если кликнули по кнопке обновления — панель не сворачиваем
+        if (e.target.closest('.md-refresh-btn')) return;
 
-function toggleDeadlinesVisibility(hide) {
-    const widget = document.getElementById('moodle-deadlines-widget');
-    if (widget) {
-        widget.style.display = hide ? 'none' : 'block';
-    }
+        widget.classList.toggle('is-collapsed');
+        const nowCollapsed = widget.classList.contains('is-collapsed');
+        sessionStorage.setItem(storageKey, nowCollapsed ? 'collapsed' : 'expanded');
+
+        const toggleBtn = header.querySelector('.md-toggle-btn');
+        toggleBtn.innerHTML = nowCollapsed ? '◀' : '▼';
+
+        // Прячем или показываем кнопку обновления
+        const refreshBtn = header.querySelector('.md-refresh-btn');
+        if (refreshBtn) refreshBtn.style.display = nowCollapsed ? 'none' : 'inline-block';
+    });
 }
 
 // === ФУНКЦИИ ИНТЕРФЕЙСА ЧАТА ===
@@ -214,10 +311,48 @@ function getHistoryForBackend() {
 }
 
 function injectChatUI() {
+    // Предотвращаем случайное дублирование чата
+    if (document.getElementById('moodle-bot-btn')) return;
+
+    if (!document.getElementById('moodle-bot-badge-fix')) {
+        const style = document.createElement('style');
+        style.id = 'moodle-bot-badge-fix';
+        style.innerHTML = `
+            #moodle-bot-btn {
+                overflow: visible !important; 
+            }
+            #moodle-bot-btn img {
+                border-radius: 50% !important;
+                display: block;
+            }
+            #moodle-bot-badge {
+                position: absolute !important;
+                top: -6px !important;
+                right: -6px !important;
+                background-color: #dc3545 !important;
+                color: white !important;
+                font-size: 11px !important;
+                font-weight: bold !important;
+                padding: 2px 6px !important;
+                border-radius: 12px !important;
+                border: 2px solid white !important;
+                z-index: 9999 !important;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.3) !important;
+                transition: transform 0.2s !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
     const btn = document.createElement('div');
     btn.id = 'moodle-bot-btn';
-    btn.innerHTML = `<img src="${chrome.runtime.getURL('assets/logo.png')}" alt="Moodle Bot">`;
+
+    btn.innerHTML = `
+        <img src="${chrome.runtime.getURL('assets/logo.png')}" alt="Moodle Bot">
+        <span id="moodle-bot-badge" style="display: none !important;">0</span>
+    `;
     document.body.appendChild(btn);
+
     const chatWindow = document.createElement('div');
     chatWindow.id = 'moodle-bot-chat';
 
@@ -231,7 +366,7 @@ function injectChatUI() {
         </div>
         <div id="moodle-bot-chat-messages"></div>
         <div id="moodle-bot-chat-input-area">
-            <input type="text" id="moodle-bot-chat-input" placeholder="Введите ваш вопрос...">
+            <input type="text" id="moodle-bot-chat-input" placeholder="Введите ваш вопрос..." autocomplete="off">
             <button id="moodle-bot-chat-send">▶</button>
         </div>
     `;
@@ -241,13 +376,13 @@ function injectChatUI() {
     const sendBtn = document.getElementById('moodle-bot-chat-send');
     const inputField = document.getElementById('moodle-bot-chat-input');
     const historyKey = `moodle_bot_chat_history_${getCourseId()}`;
-    const welcomeKey = `moodle_bot_welcome_${getCourseId()}`;
 
     const resizeBtn = document.getElementById('moodle-bot-resize-btn');
     const closeBtn = document.getElementById('moodle-bot-close-btn');
 
     let isExpanded = false;
     let isChatOpen = false;
+    let unreadCount = 0; // Счетчик непрочитанных сообщений
 
     resizeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -264,39 +399,60 @@ function injectChatUI() {
         isChatOpen = false;
         chatWindow.classList.remove('is-open');
         btn.classList.remove('is-active');
-        toggleDeadlinesVisibility(false); // Показываем дедлайны
+        toggleDeadlinesVisibility(false);
     });
 
     btn.addEventListener('click', () => {
         spinCircle();
         isChatOpen = !isChatOpen;
-        chatWindow.classList.toggle('is-open', isChatOpen);
-        btn.classList.toggle('is-active', isChatOpen);
 
-        toggleDeadlinesVisibility(isChatOpen); // Скрываем дедлайны, если открыт чат
-
+        // 1. Сначала железно очищаем интерфейс
         if (isChatOpen) {
+            unreadCount = 0;
+            const badge = document.getElementById('moodle-bot-badge');
+            if (badge) {
+                badge.style.setProperty('display', 'none', 'important');
+                badge.innerText = '0';
+            }
             setTimeout(() => {
                 messagesArea.scrollTop = messagesArea.scrollHeight;
                 inputField.focus();
             }, 180);
         }
+
+        // 2. Затем переключаем классы
+        chatWindow.classList.toggle('is-open', isChatOpen);
+        btn.classList.toggle('is-active', isChatOpen);
+
+        // 3. Вызываем внешние функции с проверкой (чтобы не ломать весь скрипт)
+        if (typeof toggleDeadlinesVisibility === 'function') {
+            toggleDeadlinesVisibility(isChatOpen);
+        } else {
+            console.warn('Функция toggleDeadlinesVisibility не найдена!');
+        }
     });
 
     messagesArea.innerHTML = sessionStorage.getItem(historyKey) || `<div class="bot-msg">Привет! Я помощник по этому курсу. Напишите тему, и я подскажу, где это находится.</div>`;
 
-    function addMessageToChat(htmlString) {
+    const addMessageToChat = function(htmlString) {
         messagesArea.innerHTML += htmlString;
         sessionStorage.setItem(historyKey, messagesArea.innerHTML);
         messagesArea.scrollTop = messagesArea.scrollHeight;
-    }
 
-    if (!sessionStorage.getItem(welcomeKey)) {
-        setTimeout(() => {
-            addMessageToChat(`<div class="bot-msg">Если хотите, я помогу быстро сориентироваться в курсе: можете спросить, где читать нужную тему.</div>`);
-            sessionStorage.setItem(welcomeKey, '1');
-        }, 800);
-    }
+        // Если чат ЗАКРЫТ, показываем уведомление на иконке
+        if (!chatWindow.classList.contains('is-open')) {
+            unreadCount++;
+            const badge = document.getElementById('moodle-bot-badge');
+            if (badge) {
+                badge.innerText = unreadCount;
+                // Принудительно показываем бейджик
+                badge.style.setProperty('display', 'block', 'important');
+                badge.style.setProperty('transform', 'scale(1.2)', 'important');
+                setTimeout(() => badge.style.setProperty('transform', 'scale(1)', 'important'), 200);
+            }
+        }
+    };
+    window.MoodleBot.addMessageToChat = addMessageToChat;
 
     messagesArea.addEventListener('click', (e) => {
         const targetBtn = e.target.closest('.moodle-bot-target-btn');
@@ -325,7 +481,7 @@ function injectChatUI() {
         chatWindow.classList.add('is-open');
         btn.classList.add('is-active');
         isChatOpen = true;
-        toggleDeadlinesVisibility(true); // Скрываем дедлайны при автооткрытии чата после телепортации
+        toggleDeadlinesVisibility(true);
         addMessageToChat(`<div class="bot-msg">${teleportMsg}</div>`);
         sessionStorage.removeItem('moodle_bot_teleport_msg');
     }
@@ -368,14 +524,6 @@ function injectChatUI() {
                 finalHtml += `</div>`;
             }
 
-            if (data.debug_context && data.debug_context.length > 0) {
-                finalHtml += `<details class="moodle-debug-panel"><summary>🔍 Показать источники (Дебаг)</summary><div><div class="moodle-debug-query"><strong>Expanded Query:</strong> ${data.expanded_query || 'НЕТ ДАННЫХ'}</div>`;
-                data.debug_context.forEach((ctx, idx) => {
-                    finalHtml += `<div class="moodle-debug-item"><strong>[${idx + 1}] ${ctx.title}</strong> <span>(Score: ${ctx.score})</span><br><p>${ctx.text}</p></div>`;
-                });
-                finalHtml += `</div></details>`;
-            }
-
             addMessageToChat(finalHtml);
 
         } catch (error) {
@@ -390,6 +538,74 @@ function injectChatUI() {
 
     sendBtn.addEventListener('click', sendMessage);
     inputField.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });
+}
+
+async function getUngradedAssignments() {
+    const doms = await getCourseDOMs();
+    const assignments = [];
+    const seenAssigns = new Set();
+
+    doms.forEach(doc => {
+        doc.querySelectorAll('li.activity.modtype_assign').forEach(act => {
+            if (seenAssigns.has(act.id)) return;
+            seenAssigns.add(act.id);
+
+            const a = act.querySelector('a.aalink');
+            if (a) assignments.push({ id: act.id, title: extractModuleTitle(act), url: a.href });
+        });
+    });
+
+    const ungradedList = [];
+
+    for (let i = 0; i < assignments.length; i += 3) {
+        const chunk = assignments.slice(i, i + 3);
+        const promises = chunk.map(async (assign) => {
+            try {
+                const response = await fetch(assign.url, { credentials: 'include' });
+                const html = await response.text();
+                const doc = new DOMParser().parseFromString(html, "text/html");
+
+                let count = 0;
+                // Сужаем поиск только до таблицы со сводкой
+                const rows = doc.querySelectorAll('.assignsummary tr, table.generaltable tr');
+
+                for (const row of rows) {
+                    const cells = row.querySelectorAll('th, td');
+
+                    // Если в ряду есть хотя бы 2 ячейки (Заголовок и Значение)
+                    if (cells.length >= 2) {
+                        const headerText = (cells[0].textContent || "").toLowerCase().trim();
+
+                        // Ищем нужный ряд
+                        if (headerText.includes('требуют оценки') || headerText.includes('needs grading') || headerText.includes('ожидают оценки')) {
+
+                            // Клонируем ячейку со значением и вычищаем скрытый текст для скринридеров
+                            const valueCell = cells[1].cloneNode(true);
+                            valueCell.querySelectorAll('.accesshide, .hidden, .sr-only').forEach(el => el.remove());
+
+                            // Спокойно забираем первую видимую цифру
+                            const match = valueCell.textContent.match(/(\d+)/);
+                            if (match) {
+                                count = parseInt(match[1], 10);
+                                break; // Нашли! Выходим из цикла
+                            }
+                        }
+                    }
+                }
+
+                if (count > 0) {
+                    ungradedList.push({
+                        title: assign.title,
+                        url: assign.url + '&action=grading', // Сразу ведем на страницу оценки
+                        count: count
+                    });
+                }
+            } catch (e) {}
+        });
+        await Promise.all(promises);
+    }
+
+    return ungradedList.sort((a, b) => b.count - a.count);
 }
 
 // === ТОЧКА ВХОДА ===
@@ -409,13 +625,205 @@ setTimeout(async () => {
     }
 
     const path = window.location.pathname;
+
     if (path.includes('/course/view.php')) {
         parseCourseIndex();
+        const courseId = getCourseId();
 
-        // Отрисовка Центра Дедлайнов
-        const deadlines = await extractDeadlinesFromCourse();
-        renderDeadlinesWidget(deadlines);
+        // === ПРОАКТИВНЫЕ ФИЧИ ДЛЯ СТУДЕНТА ===
+        if (getViewerRole() === 'student') {
+            const deadlinesCacheKey = `moodle_bot_deadlines_cache_${courseId}`;
+            const cacheTimeKey = `moodle_bot_deadlines_time_${courseId}`;
 
+            const processStudentData = async (deadlines) => {
+                window.MoodleBot.activeDeadlines = deadlines;
+                renderDeadlinesWidget(deadlines);
+
+                const processedDeadlines = deadlines.map(d => ({ ...d, daysLeft: getDaysLeft(parseRuDate(d.due_date)) })).filter(d => d.daysLeft >= 0).sort((a, b) => a.daysLeft - b.daysLeft);
+
+                // --- 1. ОНБОРДИНГ ---
+                const onboardingKey = `moodle_bot_onboarded_${courseId}`;
+                if (!localStorage.getItem(onboardingKey)) {
+                    let quizCount = 0; let assignCount = 0;
+                    const doms = await getCourseDOMs();
+                    doms.forEach(doc => {
+                        quizCount += Array.from(doc.querySelectorAll('li.activity.modtype_quiz')).filter(el => !isActivityHidden(el)).length;
+                        assignCount += Array.from(doc.querySelectorAll('li.activity.modtype_assign')).filter(el => !isActivityHidden(el)).length;
+                    });
+
+                    let welcomeMsg = `Привет! 👋 Я твой ИИ-помощник по этому курсу. Давай посмотрим, что нас ждет впереди:<br><br>📝 <b>Практических заданий:</b> ${assignCount}<br>🧠 <b>Тестов:</b> ${quizCount}<br><br>`;
+
+                    if (processedDeadlines.length > 0) {
+                        const nearest = processedDeadlines[0];
+                        welcomeMsg += `🚨 <b>Ближайший дедлайн:</b> ${nearest.title} (до ${nearest.due_date}).<br><button class="moodle-bot-target-btn" data-url="${nearest.url}" style="margin-top: 5px; width: 100%; background: #e3f2fd; border: 1px solid #90caf9; border-radius: 6px; cursor: pointer; color: #004085; font-size: 13px; padding: 6px;">Перейти к заданию</button><br>`;
+                    } else {
+                        welcomeMsg += `🎉 <b>Горящих дедлайнов пока нет.</b> Можно спокойно изучать теорию.<br><br>`;
+                    }
+                    welcomeMsg += `Если нужно найти лекцию — просто напиши мне!`;
+
+                    setTimeout(() => {
+                        if (window.MoodleBot && window.MoodleBot.addMessageToChat) {
+                            window.MoodleBot.addMessageToChat(`<div class="bot-msg">${welcomeMsg}</div>`);
+                            // Убрали принудительное открытие чата! Теперь появится только счетчик.
+                        }
+                    }, 1000);
+                    localStorage.setItem(onboardingKey, 'true');
+                }
+
+                // --- 2. ЭКСТРЕННОЕ ПРЕДУПРЕЖДЕНИЕ О ГОРЯЩИХ ДЕДЛАЙНАХ ---
+                const urgentDeadlines = processedDeadlines.filter(d => d.daysLeft <= 1);
+
+                if (urgentDeadlines.length > 0) {
+                    const warnedKey = `moodle_bot_warned_deadlines_${courseId}`;
+                    let warnedIds = [];
+                    try {
+                        warnedIds = JSON.parse(localStorage.getItem(warnedKey)) || [];
+                    } catch (e) {}
+
+                    const newUrgentDeadlines = urgentDeadlines.filter(d => !warnedIds.includes(d.moodle_id));
+
+                    if (newUrgentDeadlines.length > 0) {
+                        let warnMsg = `🚨 <b>Внимание! Горит дедлайн!</b><br>У вас есть задания, срок сдачи которых истекает менее чем через сутки:<br><br>`;
+
+                        newUrgentDeadlines.forEach(d => {
+                            warnMsg += `• <b>${d.title}</b><br>`;
+                            warnMsg += `<button class="moodle-bot-target-btn" data-url="${d.url}" style="margin-top: 5px; margin-bottom: 10px; width: 100%; background: #ffeeba; border: 1px solid #ffdf7e; border-radius: 6px; cursor: pointer; color: #856404; font-size: 13px; padding: 6px;">Срочно сдать работу</button>`;
+                            warnedIds.push(d.moodle_id);
+                        });
+
+                        setTimeout(() => {
+                            if (window.MoodleBot && window.MoodleBot.addMessageToChat) {
+                                window.MoodleBot.addMessageToChat(`<div class="bot-msg" style="border-left: 4px solid #dc3545; background: #fff8e5;">${warnMsg}</div>`);
+                                // Убрали принудительное открытие чата
+                            }
+                        }, 2500);
+
+                        localStorage.setItem(warnedKey, JSON.stringify(warnedIds));
+                    }
+                }
+            };
+
+            const fetchStudentData = async (forceRefresh = false) => {
+                const now = new Date().getTime();
+                const cachedDeadlines = sessionStorage.getItem(deadlinesCacheKey);
+                const cachedTime = sessionStorage.getItem(cacheTimeKey);
+
+                if (!forceRefresh && cachedDeadlines && cachedTime && (now - parseInt(cachedTime) < 1800000)) {
+                    processStudentData(JSON.parse(cachedDeadlines));
+                } else {
+                    const btn = document.querySelector('.md-refresh-btn');
+                    if (btn) btn.style.opacity = '0.5';
+
+                    const deadlines = await extractDeadlinesFromCourse();
+                    sessionStorage.setItem(deadlinesCacheKey, JSON.stringify(deadlines));
+                    sessionStorage.setItem(cacheTimeKey, now.toString());
+                    processStudentData(deadlines);
+                }
+            };
+
+            fetchStudentData();
+
+            document.addEventListener('click', (e) => {
+                const btn = e.target.closest('.md-refresh-btn');
+                if (btn) {
+                    e.stopPropagation();
+                    fetchStudentData(true);
+                }
+            });
+
+            setTimeout(async () => {
+                const storageKey = `moodle_bot_known_modules_${courseId}`;
+                const knownModulesStr = localStorage.getItem(storageKey);
+                const currentModules = [];
+                const doms = await getCourseDOMs();
+
+                doms.forEach(doc => {
+                    doc.querySelectorAll('li.activity').forEach(act => {
+                        const a = act.querySelector('a.aalink');
+                        if (!isActivityHidden(act) && a) {
+                            const title = extractModuleTitle(act);
+                            if (title) currentModules.push({ id: act.id, title: title, url: a.href });
+                        }
+                    });
+                });
+
+                if (knownModulesStr) {
+                    const knownModuleIds = new Set(JSON.parse(knownModulesStr));
+                    const newModules = currentModules.filter(m => !knownModuleIds.has(m.id));
+
+                    if (newModules.length > 0) {
+                        let msg = `🔔 <b>На курсе появились новые материалы!</b><br><br>`;
+                        let buttonsHtml = '<div style="display: flex; flex-direction: column; gap: 4px;">';
+                        newModules.slice(0, 3).forEach(m => { buttonsHtml += `<button class="moodle-bot-target-btn" data-url="${m.url}" data-id="${m.id}" style="text-align: left; padding: 6px 10px; background: #e3f2fd; border: 1px solid #90caf9; border-radius: 6px; cursor: pointer; color: #004085; font-size: 12px;">🆕 Открыть: ${m.title}</button>`; });
+                        msg += buttonsHtml + '</div>';
+                        if (newModules.length > 3) msg += `<div style="font-size: 11px; color: #6c757d; margin-top: 6px;">И еще ${newModules.length - 3} других...</div>`;
+
+                        if (window.MoodleBot && window.MoodleBot.addMessageToChat) {
+                            window.MoodleBot.addMessageToChat(`<div class="bot-msg" style="border-left: 4px solid #0d6efd;">${msg}</div>`);
+                        }
+                    }
+                }
+                localStorage.setItem(storageKey, JSON.stringify(currentModules.map(m => m.id)));
+            }, 3000);
+
+        // === ПРОАКТИВНЫЕ ФИЧИ ДЛЯ ПРЕПОДАВАТЕЛЯ ===
+        } else if (getViewerRole() === 'teacher') {
+            const ungradedCacheKey = `moodle_bot_ungraded_cache_${courseId}`;
+            const cacheTimeKey = `moodle_bot_ungraded_time_${courseId}`;
+
+            const teacherKey = `moodle_bot_teacher_notified_${courseId}`;
+            const today = new Date().toLocaleDateString('ru-RU');
+
+            const processTeacherData = (ungradedList) => {
+                renderUngradedWidget(ungradedList);
+
+                if (localStorage.getItem(teacherKey) !== today) {
+                    if (ungradedList.length > 0) {
+                        const totalCount = ungradedList.reduce((sum, item) => sum + item.count, 0);
+                        let msg = `🎓 <b>Приветствую, коллега!</b><br>У вас накопились непроверенные работы: <b>${totalCount} шт.</b><br><br>`;
+                        let buttonsHtml = '<div style="display: flex; flex-direction: column; gap: 4px;">';
+
+                        ungradedList.forEach(item => { buttonsHtml += `<button class="moodle-bot-target-btn" data-url="${item.url}" style="text-align: left; padding: 6px 10px; background: #f8f9fa; border: 1px solid #ced4da; border-left: 4px solid #198754; border-radius: 6px; cursor: pointer; color: #212529; font-size: 12px;">📄 ${item.title} <span style="float: right; font-weight: bold; color: #198754;">+${item.count}</span></button>`; });
+                        msg += buttonsHtml + '</div>';
+
+                        if (window.MoodleBot && window.MoodleBot.addMessageToChat) {
+                            window.MoodleBot.addMessageToChat(`<div class="bot-msg" style="border-left: 4px solid #198754; background: #f8fff9;">${msg}</div>`);
+                            // Убрали принудительное открытие чата
+                        }
+                    }
+                    localStorage.setItem(teacherKey, today);
+                }
+            };
+
+            const fetchTeacherData = async (forceRefresh = false) => {
+                const now = new Date().getTime();
+                const cachedUngraded = sessionStorage.getItem(ungradedCacheKey);
+                const cachedTime = sessionStorage.getItem(cacheTimeKey);
+
+                if (!forceRefresh && cachedUngraded && cachedTime && (now - parseInt(cachedTime) < 1800000)) {
+                    processTeacherData(JSON.parse(cachedUngraded));
+                } else {
+                    const btn = document.querySelector('.md-refresh-btn');
+                    if (btn) btn.style.opacity = '0.5';
+
+                    const ungradedList = await getUngradedAssignments();
+                    sessionStorage.setItem(ungradedCacheKey, JSON.stringify(ungradedList));
+                    sessionStorage.setItem(cacheTimeKey, now.toString());
+                    processTeacherData(ungradedList);
+                }
+            };
+
+            fetchTeacherData();
+
+            document.addEventListener('click', (e) => {
+                const btn = e.target.closest('.md-refresh-btn');
+                if (btn) {
+                    e.stopPropagation();
+                    fetchTeacherData(true);
+                }
+            });
+
+        }
     } else if (path.includes('/mod/')) {
         passiveModuleSync();
     }
