@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import create_engine, Column, String, DateTime, Text, text
+from sqlalchemy import create_engine, Column, Integer, Boolean, String, DateTime, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from datetime import datetime, timezone
@@ -33,6 +33,18 @@ class ModuleIndex(Base):
     url = Column(String)
     visibility = Column(JSONB)
     embedding = Column(Vector(384))
+
+class ChatLog(Base):
+    __tablename__ = "chat_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    course_id = Column(String(50), index=True)
+    viewer_role = Column(String(50))
+    user_query = Column(Text)
+    ai_reply = Column(Text)
+    used_context = Column(Text) # Сохраняем, на какие куски текста ИИ опирался
+    is_helpful = Column(Boolean, nullable=True)
 
 with engine.connect() as conn:
     conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))

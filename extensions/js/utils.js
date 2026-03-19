@@ -75,7 +75,7 @@ function isActivityHidden(actElement) {
 
 function parseRuDate(dateStr) {
     if (!dateStr) return null;
-    if (dateStr instanceof Date) return dateStr; // <--- ЗАЩИТА: если это уже дата, просто возвращаем её!
+    if (dateStr instanceof Date) return dateStr;
 
     const normalized = String(dateStr).trim().toLowerCase().replace(/\s+г\.?$/, '');
     const cleanDate = normalized.replace(/\d{1,2}:\d{2}/, '').trim();
@@ -103,6 +103,152 @@ function parseRuDate(dateStr) {
         if (match) return p.handler(match);
     }
     return null;
+}
+
+// === ОБНОВЛЕНО: СОБИРАЕМ ПОЛНУЮ КАРТУ КУРСА С УСЛОВИЯМИ ===
+function getCourseMap() {
+    let map = [];
+    document.querySelectorAll('li.section.main').forEach(sec => {
+        let secTitleEl = sec.querySelector('h3.sectionname');
+        if (!secTitleEl) return;
+        let secTitle = secTitleEl.innerText.trim();
+
+        let secDescEl = sec.querySelector('.summarytext');
+        let secDesc = secDescEl ? secDescEl.innerText.replace(/\n/g, ' ').trim() : "";
+
+        let items = [];
+        sec.querySelectorAll('li.activity').forEach(act => {
+            let nameEl = act.querySelector('.instancename');
+            if (!nameEl) return;
+
+            let moodleId = act.id; // НОВОЕ: Забираем системный ID (например, module-12345)
+
+            let clone = nameEl.cloneNode(true);
+            clone.querySelectorAll('.accesshide').forEach(e => e.remove());
+            let itemName = clone.innerText.trim();
+
+            let tags = [];
+            if (act.classList.contains('hiddenactivity') || act.querySelector('.badge-warning')) {
+                tags.push('[СКРЫТО]');
+            }
+            let restriction = act.querySelector('.availabilityinfo .description-inner');
+            if (restriction) tags.push(`[УСЛОВИЕ ДОСТУПА: ${restriction.innerText.replace(/\n/g, ' ').trim()}]`);
+
+            let completion = act.querySelector('.automatic-completion-conditions');
+            if (completion) {
+                let reqs = Array.from(completion.querySelectorAll('span.font-weight-normal')).map(e => e.innerText.trim());
+                if (reqs.length > 0) tags.push(`[ДЛЯ ЗАВЕРШЕНИЯ НУЖНО: ${reqs.join(', ')}]`);
+            }
+
+            let tagStr = tags.length > 0 ? ` ${tags.join(' ')}` : '';
+            // НОВОЕ: Скармливаем ИИ строчку в формате "ID: module-xxx | Название [ТЕГИ]"
+            items.push(`ID: ${moodleId} | ${itemName}${tagStr}`);
+        });
+
+        if (items.length > 0) {
+            let descStr = secDesc ? `\n  Описание/Правила: ${secDesc}` : '';
+            map.push(`Раздел [${secTitle}]:${descStr}\n  ` + items.join('\n  '));
+        }
+    });
+    return map.join('\n\n').substring(0, 3000);
+}
+
+// === НОВОЕ: ПОИСК ПРЕПОДАВАТЕЛЕЙ КУРСА ===
+async function getCourseTeachers() {
+    const courseId = getCourseId();
+    if (!courseId) return "Преподаватели неизвестны";
+
+    const cacheKey = `moodle_teachers_${courseId}`;
+    if (sessionStorage.getItem(cacheKey)) return sessionStorage.getItem(cacheKey);
+
+    try {
+        const response = await fetch(`https://online.mospolytech.ru/user/index.php?id=${courseId}&perpage=5000`);
+        const html = await response.text();
+        const doc = new DOMParser().parseFromString(html, "text/html");
+
+        let teachers = [];
+        doc.querySelectorAll('table#participants tbody tr').forEach(row => {
+            const roleCell = row.querySelector('td.c7');
+            if (roleCell && roleCell.innerText.includes('Преподаватель')) {
+                const nameCell = row.querySelector('th.c1');
+                const emailCell = row.querySelector('td.c3');
+                if (nameCell) {
+                    let name = nameCell.innerText.trim();
+                    let email = emailCell ? emailCell.innerText.trim() : '';
+                    teachers.push(`${name} (${email})`);
+                }
+            }
+        });
+        const result = teachers.length > 0 ? "Преподаватели: " + teachers.join(', ') : "Преподаватели не найдены";
+        sessionStorage.setItem(cacheKey, result);
+        return result;
+    } catch (e) {
+        return "Не удалось загрузить список преподавателей";
+    }
+}
+
+// === НОВОЕ: ПАРСИНГ ЛОКАЛЬНОГО КОНТЕКСТА СТРАНИЦЫ ===
+function getCurrentPageContext() {
+    let context = [];
+
+    // 1. Описание задания/страницы
+    let intro = document.querySelector('.activity-description #intro') || document.querySelector('.box.generalbox');
+    if (intro) context.push("ОПИСАНИЕ ИЛИ УСЛОВИЯ: " + intro.innerText.replace(/\n/g, ' ').trim());
+
+    // 2. Сроки
+    let dates = document.querySelector('.activity-dates');
+    if (dates) context.push("СРОКИ: " + dates.innerText.replace(/\n/g, ' ').trim());
+
+    // 3. Специфичные правила тестов
+    let quizInfo = document.querySelectorAll('.quizinfo p');
+    if (quizInfo.length > 0) {
+        let rules = Array.from(quizInfo).map(p => p.innerText.trim());
+        context.push("ПРАВИЛА ТЕСТА: " + rules.join(' | '));
+    }
+
+    // 4. Требования
+    let conditions = document.querySelector('.automatic-completion-conditions');
+    if (conditions) {
+        let reqs = Array.from(conditions.querySelectorAll('.badge')).map(e => e.innerText.replace(/\n/g, ' ').trim());
+        if (reqs.length > 0) context.push("СТАТУС ВЫПОЛНЕНИЯ ТРЕБОВАНИЙ: " + reqs.join(' | '));
+    }
+
+    return context.length > 0 ? context.join('\n') : "";
+}
+
+// === НОВОЕ: ПАРСИНГ ЖУРНАЛА ОЦЕНОК ===
+function getStudentGrades() {
+    let gradesTable = document.querySelector('table.user-grade');
+    if (!gradesTable) return "";
+
+    let results = [];
+    gradesTable.querySelectorAll('tr.item').forEach(tr => {
+        let nameEl = tr.querySelector('.column-itemname .gradeitemheader');
+        let gradeEl = tr.querySelector('.column-grade');
+        if (nameEl && gradeEl) {
+            let name = nameEl.innerText.replace(/\n/g, ' ').trim();
+            let grade = gradeEl.innerText.trim();
+            if (grade === '-') grade = 'Нет оценки';
+            results.push(`- ${name}: ${grade}`);
+        }
+    });
+    return results.length > 0 ? "ВЫПИСКА ОЦЕНОК СТУДЕНТА:\n" + results.join('\n') : "";
+}
+
+// === НОВОЕ: ПАРСИНГ СТАТУСА КОНКРЕТНОЙ ЛАБЫ ===
+function getAssignmentStatus() {
+    let statusTable = document.querySelector('.submissionstatustable table');
+    if (!statusTable) return "";
+
+    let rows = [];
+    statusTable.querySelectorAll('tr').forEach(tr => {
+        let th = tr.querySelector('th');
+        let td = tr.querySelector('td');
+        if (th && td) {
+            rows.push(`${th.innerText.trim()}: ${td.innerText.replace(/\n/g, ' ').trim()}`);
+        }
+    });
+    return rows.length > 0 ? "СТАТУС СДАЧИ ТЕКУЩЕГО ЗАДАНИЯ:\n" + rows.join('\n') : "";
 }
 
 function cleanText(text) {

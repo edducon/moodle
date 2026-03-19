@@ -28,7 +28,6 @@ async function extractDeadlinesFromCourse() {
     const assignments = [];
     const seenAssigns = new Set();
 
-    // 1. Быстро собираем все ссылки на задания
     for (const doc of doms) {
         const assigns = doc.querySelectorAll('li.activity.modtype_assign');
         for (const act of assigns) {
@@ -41,7 +40,6 @@ async function extractDeadlinesFromCourse() {
 
     const deadlines = [];
 
-    // 2. Асинхронно скачиваем страницы пачками по 4 штуки (ускорение в 4 раза!)
     for (let i = 0; i < assignments.length; i += 4) {
         const chunk = assignments.slice(i, i + 4);
         const promises = chunk.map(async (assign) => {
@@ -99,7 +97,6 @@ function renderUngradedWidget(ungradedList) {
         ? `<span style="position: absolute; top: -6px; right: -8px; background: #dc3545; color: white; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 10px; line-height: 1; border: 2px solid #343a40; z-index: 2;" title="Ждут проверки">${totalCount}</span>`
         : `<span style="position: absolute; top: -4px; right: -6px; background: #28a745; color: white; font-size: 9px; font-weight: bold; padding: 2px 4px; border-radius: 10px; line-height: 1; border: 2px solid #343a40; z-index: 2;" title="Всё проверено">✓</span>`;
 
-    // Кнопка обновления в шапке (прячется, если виджет свернут)
     header.innerHTML = `
         <div style="position: relative; display: inline-flex; align-items: center; justify-content: center; margin-right: 12px; margin-left: 5px;">
             <span class="md-icon" style="margin-right: 0; font-size: 16px;">📝</span>
@@ -138,7 +135,6 @@ function renderUngradedWidget(ungradedList) {
     document.body.appendChild(widget);
 
     header.addEventListener('click', (e) => {
-        // Если кликнули по кнопке обновления — панель не сворачиваем
         if (e.target.closest('.md-refresh-btn')) return;
 
         widget.classList.toggle('is-collapsed');
@@ -148,7 +144,6 @@ function renderUngradedWidget(ungradedList) {
         const toggleBtn = header.querySelector('.md-toggle-btn');
         toggleBtn.innerHTML = nowCollapsed ? '◀' : '▼';
 
-        // Прячем или показываем кнопку обновления
         const refreshBtn = header.querySelector('.md-refresh-btn');
         if (refreshBtn) refreshBtn.style.display = nowCollapsed ? 'none' : 'inline-block';
     });
@@ -180,7 +175,6 @@ function renderDeadlinesWidget(deadlines) {
         ? `<span style="position: absolute; top: -6px; right: -8px; background: #dc3545; color: white; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 10px; line-height: 1; border: 2px solid #343a40; z-index: 2;" title="Ожидают сдачи">${processed.length}</span>`
         : `<span style="position: absolute; top: -4px; right: -6px; background: #28a745; color: white; font-size: 9px; font-weight: bold; padding: 2px 4px; border-radius: 10px; line-height: 1; border: 2px solid #343a40; z-index: 2;" title="Всё сдано">✓</span>`;
 
-    // Кнопка обновления в шапке (прячется, если виджет свернут)
     header.innerHTML = `
         <div style="position: relative; display: inline-flex; align-items: center; justify-content: center; margin-right: 12px; margin-left: 5px;">
             <span class="md-icon" style="margin-right: 0; font-size: 16px;">📅</span>
@@ -226,7 +220,6 @@ function renderDeadlinesWidget(deadlines) {
     document.body.appendChild(widget);
 
     header.addEventListener('click', (e) => {
-        // Если кликнули по кнопке обновления — панель не сворачиваем
         if (e.target.closest('.md-refresh-btn')) return;
 
         widget.classList.toggle('is-collapsed');
@@ -236,10 +229,26 @@ function renderDeadlinesWidget(deadlines) {
         const toggleBtn = header.querySelector('.md-toggle-btn');
         toggleBtn.innerHTML = nowCollapsed ? '◀' : '▼';
 
-        // Прячем или показываем кнопку обновления
         const refreshBtn = header.querySelector('.md-refresh-btn');
         if (refreshBtn) refreshBtn.style.display = nowCollapsed ? 'none' : 'inline-block';
     });
+}
+
+function toggleDeadlinesVisibility(isChatOpen) {
+    const widget = document.getElementById('moodle-deadlines-widget');
+    if (widget) {
+        if (isChatOpen) {
+            widget.style.opacity = '0';
+            widget.style.pointerEvents = 'none';
+            setTimeout(() => { if (widget.style.opacity === '0') widget.style.display = 'none'; }, 300);
+        } else {
+            widget.style.display = 'block';
+            setTimeout(() => {
+                widget.style.opacity = '1';
+                widget.style.pointerEvents = 'auto';
+            }, 10);
+        }
+    }
 }
 
 // === ФУНКЦИИ ИНТЕРФЕЙСА ЧАТА ===
@@ -310,35 +319,35 @@ function getHistoryForBackend() {
     return history.slice(-6);
 }
 
+// Отправка оценки ответа на сервер (RLHF)
+window.sendFeedback = async function(logId, isHelpful, btnElement) {
+    try {
+        await fetch(`http://127.0.0.1:8000/api/feedback`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ log_id: logId, is_helpful: isHelpful })
+        });
+        if (btnElement && btnElement.parentElement) {
+            btnElement.parentElement.innerHTML = '<span style="font-size:11px; color:#6c757d;">Спасибо за отзыв!</span>';
+        }
+    } catch (e) { console.error("Ошибка отправки фидбека"); }
+};
+
 function injectChatUI() {
-    // Предотвращаем случайное дублирование чата
     if (document.getElementById('moodle-bot-btn')) return;
 
     if (!document.getElementById('moodle-bot-badge-fix')) {
         const style = document.createElement('style');
         style.id = 'moodle-bot-badge-fix';
         style.innerHTML = `
-            #moodle-bot-btn {
-                overflow: visible !important; 
-            }
-            #moodle-bot-btn img {
-                border-radius: 50% !important;
-                display: block;
-            }
+            #moodle-bot-btn { overflow: visible !important; }
+            #moodle-bot-btn img { border-radius: 50% !important; display: block; }
             #moodle-bot-badge {
-                position: absolute !important;
-                top: -6px !important;
-                right: -6px !important;
-                background-color: #dc3545 !important;
-                color: white !important;
-                font-size: 11px !important;
-                font-weight: bold !important;
-                padding: 2px 6px !important;
-                border-radius: 12px !important;
-                border: 2px solid white !important;
-                z-index: 9999 !important;
-                box-shadow: 0 2px 5px rgba(0,0,0,0.3) !important;
-                transition: transform 0.2s !important;
+                position: absolute !important; top: -6px !important; right: -6px !important;
+                background-color: #dc3545 !important; color: white !important; font-size: 11px !important;
+                font-weight: bold !important; padding: 2px 6px !important; border-radius: 12px !important;
+                border: 2px solid white !important; z-index: 9999 !important;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.3) !important; transition: transform 0.2s !important;
             }
         `;
         document.head.appendChild(style);
@@ -375,14 +384,14 @@ function injectChatUI() {
     const messagesArea = document.getElementById('moodle-bot-chat-messages');
     const sendBtn = document.getElementById('moodle-bot-chat-send');
     const inputField = document.getElementById('moodle-bot-chat-input');
-    const historyKey = `moodle_bot_chat_history_${getCourseId()}`;
+    const historyKey = `moodle_bot_chat_history_${getCourseId()}_${getViewerRole()}`;
 
     const resizeBtn = document.getElementById('moodle-bot-resize-btn');
     const closeBtn = document.getElementById('moodle-bot-close-btn');
 
     let isExpanded = false;
     let isChatOpen = false;
-    let unreadCount = 0; // Счетчик непрочитанных сообщений
+    let unreadCount = 0;
 
     resizeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -406,7 +415,6 @@ function injectChatUI() {
         spinCircle();
         isChatOpen = !isChatOpen;
 
-        // 1. Сначала железно очищаем интерфейс
         if (isChatOpen) {
             unreadCount = 0;
             const badge = document.getElementById('moodle-bot-badge');
@@ -420,16 +428,9 @@ function injectChatUI() {
             }, 180);
         }
 
-        // 2. Затем переключаем классы
         chatWindow.classList.toggle('is-open', isChatOpen);
         btn.classList.toggle('is-active', isChatOpen);
-
-        // 3. Вызываем внешние функции с проверкой (чтобы не ломать весь скрипт)
-        if (typeof toggleDeadlinesVisibility === 'function') {
-            toggleDeadlinesVisibility(isChatOpen);
-        } else {
-            console.warn('Функция toggleDeadlinesVisibility не найдена!');
-        }
+        toggleDeadlinesVisibility(isChatOpen);
     });
 
     messagesArea.innerHTML = sessionStorage.getItem(historyKey) || `<div class="bot-msg">Привет! Я помощник по этому курсу. Напишите тему, и я подскажу, где это находится.</div>`;
@@ -439,13 +440,11 @@ function injectChatUI() {
         sessionStorage.setItem(historyKey, messagesArea.innerHTML);
         messagesArea.scrollTop = messagesArea.scrollHeight;
 
-        // Если чат ЗАКРЫТ, показываем уведомление на иконке
         if (!chatWindow.classList.contains('is-open')) {
             unreadCount++;
             const badge = document.getElementById('moodle-bot-badge');
             if (badge) {
                 badge.innerText = unreadCount;
-                // Принудительно показываем бейджик
                 badge.style.setProperty('display', 'block', 'important');
                 badge.style.setProperty('transform', 'scale(1.2)', 'important');
                 setTimeout(() => badge.style.setProperty('transform', 'scale(1)', 'important'), 200);
@@ -454,7 +453,26 @@ function injectChatUI() {
     };
     window.MoodleBot.addMessageToChat = addMessageToChat;
 
-    messagesArea.addEventListener('click', (e) => {
+    messagesArea.addEventListener('click', async (e) => {
+        // 1. ОБРАБОТКА КНОПОК ФИДБЕКА (RLHF)
+        const feedbackBtn = e.target.closest('.feedback-btn');
+        if (feedbackBtn) {
+            const logId = parseInt(feedbackBtn.getAttribute('data-log-id'));
+            const isHelpful = parseInt(feedbackBtn.getAttribute('data-helpful'));
+            try {
+                await fetch(`http://127.0.0.1:8000/api/feedback`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ log_id: logId, is_helpful: isHelpful })
+                });
+                feedbackBtn.parentElement.innerHTML = '<span style="font-size:11px; color:#6c757d;">Спасибо за отзыв! Данные записаны.</span>';
+            } catch (err) {
+                console.error("Ошибка отправки фидбека", err);
+            }
+            return; // Прерываем выполнение, чтобы не сработали другие клики
+        }
+
+        // 2. ОБРАБОТКА КЛИКА ПО ССЫЛКАМ-КНОПКАМ КУРСА
         const targetBtn = e.target.closest('.moodle-bot-target-btn');
         if (!targetBtn) return;
 
@@ -499,6 +517,13 @@ function injectChatUI() {
         inputField.value = '';
 
         try {
+            // СОБИРАЕМ ПОЛНЫЙ КОНТЕКСТ ДЛЯ ИИ
+            const teachersInfo = typeof getCourseTeachers === 'function' ? await getCourseTeachers() : "";
+            const pageContext = typeof getCurrentPageContext === 'function' ? getCurrentPageContext() : "";
+            const studentGrades = typeof getStudentGrades === 'function' ? getStudentGrades() : "";
+            const assignStatus = typeof getAssignmentStatus === 'function' ? getAssignmentStatus() : "";
+            const courseMap = typeof getCourseMap === 'function' ? getCourseMap() : "";
+
             const response = await fetch(`http://127.0.0.1:8000/api/smart-search`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -507,7 +532,13 @@ function injectChatUI() {
                     message: text,
                     history: getHistoryForBackend(),
                     viewer_role: getViewerRole(),
-                    deadlines: window.MoodleBot.activeDeadlines || []
+                    deadlines: window.MoodleBot.activeDeadlines || [],
+                    course_title: document.querySelector('.headermain')?.innerText.trim() || 'Неизвестный курс',
+                    course_map: courseMap,
+                    teachers: teachersInfo,
+                    page_context: pageContext,
+                    grades: studentGrades,
+                    assign_status: assignStatus
                 })
             });
 
@@ -516,12 +547,40 @@ function injectChatUI() {
 
             let finalHtml = `<div class="bot-msg">${data.reply.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/\* /g, '<br>• ')}</div>`;
 
+            // Рендер кнопок навигации (теперь их может быть несколько)
             if (data.targets && data.targets.length > 0) {
-                finalHtml += `<div style="display: flex; flex-direction: column; gap: 4px;">`;
+                finalHtml += `<div style="display: flex; flex-direction: column; gap: 4px; margin-top: 6px;">`;
                 data.targets.forEach(t => {
                     finalHtml += `<button class="moodle-bot-target-btn" data-url="${t.url}" data-id="${t.id}" data-snippet="${t.snippet || ''}">🎯 Переход: ${t.title}</button>`;
                 });
                 finalHtml += `</div>`;
+            }
+
+            // Рендер безопасных кнопок фидбека (через data-атрибуты, без onclick)
+            if (data.log_id) {
+                finalHtml += `
+                <div class="bot-feedback-btns" style="text-align: right; margin-top: 8px;">
+                    <button class="feedback-btn" data-log-id="${data.log_id}" data-helpful="1" style="background:none; border:none; cursor:pointer; font-size:12px; color:#28a745;">👍 Помогло</button>
+                    <button class="feedback-btn" data-log-id="${data.log_id}" data-helpful="0" style="background:none; border:none; cursor:pointer; font-size:12px; color:#dc3545; margin-left: 10px;">👎 Не помогло</button>
+                </div>`;
+            }
+
+            // Рендер ДЕБАГ-ОКНА (Скрыто под спойлером)
+            if (data.debug_context && data.debug_context.length > 0) {
+                let debugHtml = `
+                <details style="margin-top: 10px; font-size: 11px; color: #555; background: #f8f9fa; padding: 6px; border-radius: 6px; border: 1px solid #ddd;">
+                    <summary style="cursor: pointer; font-weight: bold; outline: none;">🐛 Дебаг-информация (Векторный поиск)</summary>
+                    <ul style="margin: 6px 0 0 16px; padding: 0;">`;
+                data.debug_context.forEach(ctx => {
+                    // Score - это дистанция: чем меньше, тем точнее совпадение
+                    debugHtml += `
+                        <li style="margin-bottom: 4px;">
+                            <b>${ctx.title}</b> (Score: <span style="color:${ctx.score < 0.4 ? 'green' : 'red'}">${ctx.score}</span>)<br>
+                            <span style="font-size: 10px; color: #888;">${ctx.text.substring(0, 150)}...</span>
+                        </li>`;
+                });
+                debugHtml += `</ul></details>`;
+                finalHtml += debugHtml;
             }
 
             addMessageToChat(finalHtml);
@@ -566,28 +625,19 @@ async function getUngradedAssignments() {
                 const doc = new DOMParser().parseFromString(html, "text/html");
 
                 let count = 0;
-                // Сужаем поиск только до таблицы со сводкой
                 const rows = doc.querySelectorAll('.assignsummary tr, table.generaltable tr');
 
                 for (const row of rows) {
                     const cells = row.querySelectorAll('th, td');
-
-                    // Если в ряду есть хотя бы 2 ячейки (Заголовок и Значение)
                     if (cells.length >= 2) {
                         const headerText = (cells[0].textContent || "").toLowerCase().trim();
-
-                        // Ищем нужный ряд
                         if (headerText.includes('требуют оценки') || headerText.includes('needs grading') || headerText.includes('ожидают оценки')) {
-
-                            // Клонируем ячейку со значением и вычищаем скрытый текст для скринридеров
                             const valueCell = cells[1].cloneNode(true);
                             valueCell.querySelectorAll('.accesshide, .hidden, .sr-only').forEach(el => el.remove());
-
-                            // Спокойно забираем первую видимую цифру
                             const match = valueCell.textContent.match(/(\d+)/);
                             if (match) {
                                 count = parseInt(match[1], 10);
-                                break; // Нашли! Выходим из цикла
+                                break;
                             }
                         }
                     }
@@ -596,7 +646,7 @@ async function getUngradedAssignments() {
                 if (count > 0) {
                     ungradedList.push({
                         title: assign.title,
-                        url: assign.url + '&action=grading', // Сразу ведем на страницу оценки
+                        url: assign.url + '&action=grading',
                         count: count
                     });
                 }
@@ -630,7 +680,6 @@ setTimeout(async () => {
         parseCourseIndex();
         const courseId = getCourseId();
 
-        // === ПРОАКТИВНЫЕ ФИЧИ ДЛЯ СТУДЕНТА ===
         if (getViewerRole() === 'student') {
             const deadlinesCacheKey = `moodle_bot_deadlines_cache_${courseId}`;
             const cacheTimeKey = `moodle_bot_deadlines_time_${courseId}`;
@@ -641,7 +690,6 @@ setTimeout(async () => {
 
                 const processedDeadlines = deadlines.map(d => ({ ...d, daysLeft: getDaysLeft(parseRuDate(d.due_date)) })).filter(d => d.daysLeft >= 0).sort((a, b) => a.daysLeft - b.daysLeft);
 
-                // --- 1. ОНБОРДИНГ ---
                 const onboardingKey = `moodle_bot_onboarded_${courseId}`;
                 if (!localStorage.getItem(onboardingKey)) {
                     let quizCount = 0; let assignCount = 0;
@@ -664,13 +712,11 @@ setTimeout(async () => {
                     setTimeout(() => {
                         if (window.MoodleBot && window.MoodleBot.addMessageToChat) {
                             window.MoodleBot.addMessageToChat(`<div class="bot-msg">${welcomeMsg}</div>`);
-                            // Убрали принудительное открытие чата! Теперь появится только счетчик.
                         }
                     }, 1000);
                     localStorage.setItem(onboardingKey, 'true');
                 }
 
-                // --- 2. ЭКСТРЕННОЕ ПРЕДУПРЕЖДЕНИЕ О ГОРЯЩИХ ДЕДЛАЙНАХ ---
                 const urgentDeadlines = processedDeadlines.filter(d => d.daysLeft <= 1);
 
                 if (urgentDeadlines.length > 0) {
@@ -694,7 +740,6 @@ setTimeout(async () => {
                         setTimeout(() => {
                             if (window.MoodleBot && window.MoodleBot.addMessageToChat) {
                                 window.MoodleBot.addMessageToChat(`<div class="bot-msg" style="border-left: 4px solid #dc3545; background: #fff8e5;">${warnMsg}</div>`);
-                                // Убрали принудительное открытие чата
                             }
                         }, 2500);
 
@@ -766,7 +811,6 @@ setTimeout(async () => {
                 localStorage.setItem(storageKey, JSON.stringify(currentModules.map(m => m.id)));
             }, 3000);
 
-        // === ПРОАКТИВНЫЕ ФИЧИ ДЛЯ ПРЕПОДАВАТЕЛЯ ===
         } else if (getViewerRole() === 'teacher') {
             const ungradedCacheKey = `moodle_bot_ungraded_cache_${courseId}`;
             const cacheTimeKey = `moodle_bot_ungraded_time_${courseId}`;
@@ -788,7 +832,6 @@ setTimeout(async () => {
 
                         if (window.MoodleBot && window.MoodleBot.addMessageToChat) {
                             window.MoodleBot.addMessageToChat(`<div class="bot-msg" style="border-left: 4px solid #198754; background: #f8fff9;">${msg}</div>`);
-                            // Убрали принудительное открытие чата
                         }
                     }
                     localStorage.setItem(teacherKey, today);
@@ -822,9 +865,12 @@ setTimeout(async () => {
                     fetchTeacherData(true);
                 }
             });
-
         }
-    } else if (path.includes('/mod/')) {
-        passiveModuleSync();
+    } else if (path.includes('/mod/') || path.includes('/grade/')) {
+        // Фоновая логика для других страниц
+        if (typeof passiveModuleSync === 'function') passiveModuleSync();
+
+        // Вызываем функцию сбора преподавателей один раз в фоне, чтобы закэшировать
+        if (typeof getCourseTeachers === 'function') getCourseTeachers();
     }
 }, 1500);
