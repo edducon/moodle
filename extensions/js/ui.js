@@ -28,6 +28,7 @@ async function extractDeadlinesFromCourse() {
     const assignments = [];
     const seenAssigns = new Set();
 
+    // 1. Быстро собираем все ссылки на задания
     for (const doc of doms) {
         const assigns = doc.querySelectorAll('li.activity.modtype_assign');
         for (const act of assigns) {
@@ -40,6 +41,7 @@ async function extractDeadlinesFromCourse() {
 
     const deadlines = [];
 
+    // 2. Асинхронно скачиваем страницы пачками по 4 штуки
     for (let i = 0; i < assignments.length; i += 4) {
         const chunk = assignments.slice(i, i + 4);
         const promises = chunk.map(async (assign) => {
@@ -236,18 +238,178 @@ function renderDeadlinesWidget(deadlines) {
 
 function toggleDeadlinesVisibility(isChatOpen) {
     const widget = document.getElementById('moodle-deadlines-widget');
-    if (widget) {
-        if (isChatOpen) {
-            widget.style.opacity = '0';
-            widget.style.pointerEvents = 'none';
-            setTimeout(() => { if (widget.style.opacity === '0') widget.style.display = 'none'; }, 300);
-        } else {
-            widget.style.display = 'block';
-            setTimeout(() => {
-                widget.style.opacity = '1';
-                widget.style.pointerEvents = 'auto';
-            }, 10);
+    if (!widget) return;
+
+    if (isChatOpen) {
+        widget.style.opacity = '0';
+        widget.style.pointerEvents = 'none';
+        widget.style.transform = 'translateY(10px)';
+    } else {
+        widget.style.opacity = '1';
+        widget.style.pointerEvents = 'auto';
+        widget.style.transform = 'translateY(0)';
+    }
+}
+
+// === НОВЫЕ ФУНКЦИИ ДЛЯ КОНТЕКСТА ===
+
+function trimLongText(text, maxLen = 120000) {
+    const value = (text || '').trim();
+    if (value.length <= maxLen) return value;
+    return value.slice(0, maxLen);
+}
+
+function getPageContextHtml() {
+    try {
+        const main = document.querySelector('[role="main"]') ||
+                     document.querySelector('#region-main') ||
+                     document.querySelector('main') ||
+                     document.body;
+
+        if (!main) return '';
+
+        const clone = main.cloneNode(true);
+
+        clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
+
+        return trimLongText(clone.outerHTML, 180000);
+    } catch (e) {
+        return '';
+    }
+}
+
+function getCourseTitleText() {
+    try {
+        const candidates = [
+            document.querySelector('h1'),
+            document.querySelector('.page-header-headings h1'),
+            document.querySelector('#page-header h1'),
+            document.querySelector('.page-context-header h1')
+        ].filter(Boolean);
+
+        if (candidates.length > 0) {
+            const title = (candidates[0].innerText || '').trim();
+            if (title) return title;
         }
+
+        return document.title || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+function getTeachersText() {
+    try {
+        const blocks = [];
+
+        const pageText = document.body ? document.body.innerText : '';
+        const teacherMatches = pageText.match(/Преподавател[ья][\s\S]{0,800}/i);
+        if (teacherMatches && teacherMatches[0]) {
+            blocks.push(teacherMatches[0].slice(0, 800));
+        }
+
+        const selectors = [
+            '.teachers',
+            '.teachers-list',
+            '.coursecontacts',
+            '.course-contacts',
+            '.teacher-info',
+            '.course-info-container'
+        ];
+
+        selectors.forEach(sel => {
+            document.querySelectorAll(sel).forEach(el => {
+                const txt = (el.innerText || '').trim();
+                if (txt) blocks.push(txt);
+            });
+        });
+
+        const unique = [...new Set(blocks.map(x => x.trim()).filter(Boolean))];
+        return trimLongText(unique.join('\n\n'), 4000);
+    } catch (e) {
+        return '';
+    }
+}
+
+function getCourseMapText() {
+    try {
+        const items = [];
+        document.querySelectorAll('li.activity').forEach((act) => {
+            if (typeof isActivityHidden === 'function' && isActivityHidden(act)) return;
+
+            const title = typeof extractModuleTitle === 'function'
+                ? extractModuleTitle(act)
+                : ((act.querySelector('.instancename, .activityname')?.innerText || '').trim());
+
+            if (!title) return;
+
+            let kind = 'other';
+            if (act.classList.contains('modtype_assign')) kind = 'lab';
+            else if (act.classList.contains('modtype_quiz')) kind = 'quiz';
+            else if (act.classList.contains('modtype_forum')) kind = 'forum';
+            else if (
+                act.classList.contains('modtype_page') ||
+                act.classList.contains('modtype_book') ||
+                act.classList.contains('modtype_file') ||
+                act.classList.contains('modtype_folder') ||
+                act.classList.contains('modtype_url') ||
+                act.classList.contains('modtype_lesson')
+            ) kind = 'lecture';
+
+            items.push(`${title} | type=${kind} | id=${act.id || ''}`);
+        });
+
+        return trimLongText(items.join('\n'), 12000);
+    } catch (e) {
+        return '';
+    }
+}
+
+function getGradesText() {
+    try {
+        const bodyText = document.body ? document.body.innerText : '';
+        const gradeHints = [];
+
+        const patterns = [
+            /Итог[\s\S]{0,400}/i,
+            /Оценк[\s\S]{0,400}/i,
+            /Баллы[\s\S]{0,400}/i
+        ];
+
+        patterns.forEach((pattern) => {
+            const m = bodyText.match(pattern);
+            if (m && m[0]) gradeHints.push(m[0]);
+        });
+
+        const unique = [...new Set(gradeHints.map(x => x.trim()).filter(Boolean))];
+        return trimLongText(unique.join('\n\n'), 2500);
+    } catch (e) {
+        return '';
+    }
+}
+
+function getAssignStatusText() {
+    try {
+        const selectors = [
+            '.submissionstatustable',
+            '.assignsubmission',
+            '.submissionstatus',
+            '.submissionsummarytable',
+            '.activity-information'
+        ];
+
+        const parts = [];
+        selectors.forEach(sel => {
+            document.querySelectorAll(sel).forEach(el => {
+                const txt = (el.innerText || '').trim();
+                if (txt) parts.push(txt);
+            });
+        });
+
+        const unique = [...new Set(parts.map(x => x.trim()).filter(Boolean))];
+        return trimLongText(unique.join('\n\n'), 4000);
+    } catch (e) {
+        return '';
     }
 }
 
@@ -319,20 +481,6 @@ function getHistoryForBackend() {
     return history.slice(-6);
 }
 
-// Отправка оценки ответа на сервер (RLHF)
-window.sendFeedback = async function(logId, isHelpful, btnElement) {
-    try {
-        await fetch(`http://127.0.0.1:8000/api/feedback`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ log_id: logId, is_helpful: isHelpful })
-        });
-        if (btnElement && btnElement.parentElement) {
-            btnElement.parentElement.innerHTML = '<span style="font-size:11px; color:#6c757d;">Спасибо за отзыв!</span>';
-        }
-    } catch (e) { console.error("Ошибка отправки фидбека"); }
-};
-
 function injectChatUI() {
     if (document.getElementById('moodle-bot-btn')) return;
 
@@ -340,14 +488,27 @@ function injectChatUI() {
         const style = document.createElement('style');
         style.id = 'moodle-bot-badge-fix';
         style.innerHTML = `
-            #moodle-bot-btn { overflow: visible !important; }
-            #moodle-bot-btn img { border-radius: 50% !important; display: block; }
+            #moodle-bot-btn {
+                overflow: visible !important; 
+            }
+            #moodle-bot-btn img {
+                border-radius: 50% !important;
+                display: block;
+            }
             #moodle-bot-badge {
-                position: absolute !important; top: -6px !important; right: -6px !important;
-                background-color: #dc3545 !important; color: white !important; font-size: 11px !important;
-                font-weight: bold !important; padding: 2px 6px !important; border-radius: 12px !important;
-                border: 2px solid white !important; z-index: 9999 !important;
-                box-shadow: 0 2px 5px rgba(0,0,0,0.3) !important; transition: transform 0.2s !important;
+                position: absolute !important;
+                top: -6px !important;
+                right: -6px !important;
+                background-color: #dc3545 !important;
+                color: white !important;
+                font-size: 11px !important;
+                font-weight: bold !important;
+                padding: 2px 6px !important;
+                border-radius: 12px !important;
+                border: 2px solid white !important;
+                z-index: 9999 !important;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.3) !important;
+                transition: transform 0.2s !important;
             }
         `;
         document.head.appendChild(style);
@@ -384,7 +545,7 @@ function injectChatUI() {
     const messagesArea = document.getElementById('moodle-bot-chat-messages');
     const sendBtn = document.getElementById('moodle-bot-chat-send');
     const inputField = document.getElementById('moodle-bot-chat-input');
-    const historyKey = `moodle_bot_chat_history_${getCourseId()}_${getViewerRole()}`;
+    const historyKey = `moodle_bot_chat_history_${getCourseId()}`;
 
     const resizeBtn = document.getElementById('moodle-bot-resize-btn');
     const closeBtn = document.getElementById('moodle-bot-close-btn');
@@ -430,7 +591,12 @@ function injectChatUI() {
 
         chatWindow.classList.toggle('is-open', isChatOpen);
         btn.classList.toggle('is-active', isChatOpen);
-        toggleDeadlinesVisibility(isChatOpen);
+
+        if (typeof toggleDeadlinesVisibility === 'function') {
+            toggleDeadlinesVisibility(isChatOpen);
+        } else {
+            console.warn('Функция toggleDeadlinesVisibility не найдена!');
+        }
     });
 
     messagesArea.innerHTML = sessionStorage.getItem(historyKey) || `<div class="bot-msg">Привет! Я помощник по этому курсу. Напишите тему, и я подскажу, где это находится.</div>`;
@@ -453,26 +619,7 @@ function injectChatUI() {
     };
     window.MoodleBot.addMessageToChat = addMessageToChat;
 
-    messagesArea.addEventListener('click', async (e) => {
-        // 1. ОБРАБОТКА КНОПОК ФИДБЕКА (RLHF)
-        const feedbackBtn = e.target.closest('.feedback-btn');
-        if (feedbackBtn) {
-            const logId = parseInt(feedbackBtn.getAttribute('data-log-id'));
-            const isHelpful = parseInt(feedbackBtn.getAttribute('data-helpful'));
-            try {
-                await fetch(`http://127.0.0.1:8000/api/feedback`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ log_id: logId, is_helpful: isHelpful })
-                });
-                feedbackBtn.parentElement.innerHTML = '<span style="font-size:11px; color:#6c757d;">Спасибо за отзыв! Данные записаны.</span>';
-            } catch (err) {
-                console.error("Ошибка отправки фидбека", err);
-            }
-            return; // Прерываем выполнение, чтобы не сработали другие клики
-        }
-
-        // 2. ОБРАБОТКА КЛИКА ПО ССЫЛКАМ-КНОПКАМ КУРСА
+    messagesArea.addEventListener('click', (e) => {
         const targetBtn = e.target.closest('.moodle-bot-target-btn');
         if (!targetBtn) return;
 
@@ -505,6 +652,7 @@ function injectChatUI() {
     }
 
     let isSending = false;
+
     const sendMessage = async () => {
         if (isSending) return;
         const text = inputField.value.trim();
@@ -517,70 +665,68 @@ function injectChatUI() {
         inputField.value = '';
 
         try {
-            // СОБИРАЕМ ПОЛНЫЙ КОНТЕКСТ ДЛЯ ИИ
-            const teachersInfo = typeof getCourseTeachers === 'function' ? await getCourseTeachers() : "";
-            const pageContext = typeof getCurrentPageContext === 'function' ? getCurrentPageContext() : "";
-            const studentGrades = typeof getStudentGrades === 'function' ? getStudentGrades() : "";
-            const assignStatus = typeof getAssignmentStatus === 'function' ? getAssignmentStatus() : "";
-            const courseMap = typeof getCourseMap === 'function' ? getCourseMap() : "";
+            const payload = {
+                course_id: getCourseId(),
+                message: text,
+                history: getHistoryForBackend(),
+                viewer_role: getViewerRole(),
+                deadlines: window.MoodleBot.activeDeadlines || [],
+                course_title: getCourseTitleText(),
+                course_map: getCourseMapText(),
+                teachers: getTeachersText(),
+                page_context: getPageContextHtml(),
+                grades: getGradesText(),
+                assign_status: getAssignStatusText()
+            };
 
             const response = await fetch(`http://127.0.0.1:8000/api/smart-search`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    course_id: getCourseId(),
-                    message: text,
-                    history: getHistoryForBackend(),
-                    viewer_role: getViewerRole(),
-                    deadlines: window.MoodleBot.activeDeadlines || [],
-                    course_title: document.querySelector('.headermain')?.innerText.trim() || 'Неизвестный курс',
-                    course_map: courseMap,
-                    teachers: teachersInfo,
-                    page_context: pageContext,
-                    grades: studentGrades,
-                    assign_status: assignStatus
-                })
+                body: JSON.stringify(payload)
             });
 
             if (!response.ok) throw new Error("Ошибка сервера");
             const data = await response.json();
 
-            let finalHtml = `<div class="bot-msg">${data.reply.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/\* /g, '<br>• ')}</div>`;
+            let finalHtml = `<div class="bot-msg">${(data.reply || '')
+                .replace(/\n/g, '<br>')
+                .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+                .replace(/\* /g, '<br>• ')}</div>`;
 
-            // Рендер кнопок навигации (теперь их может быть несколько)
             if (data.targets && data.targets.length > 0) {
-                finalHtml += `<div style="display: flex; flex-direction: column; gap: 4px; margin-top: 6px;">`;
+                finalHtml += `<div style="display: flex; flex-direction: column; gap: 4px;">`;
                 data.targets.forEach(t => {
                     finalHtml += `<button class="moodle-bot-target-btn" data-url="${t.url}" data-id="${t.id}" data-snippet="${t.snippet || ''}">🎯 Переход: ${t.title}</button>`;
                 });
                 finalHtml += `</div>`;
             }
 
-            // Рендер безопасных кнопок фидбека (через data-атрибуты, без onclick)
-            if (data.log_id) {
-                finalHtml += `
-                <div class="bot-feedback-btns" style="text-align: right; margin-top: 8px;">
-                    <button class="feedback-btn" data-log-id="${data.log_id}" data-helpful="1" style="background:none; border:none; cursor:pointer; font-size:12px; color:#28a745;">👍 Помогло</button>
-                    <button class="feedback-btn" data-log-id="${data.log_id}" data-helpful="0" style="background:none; border:none; cursor:pointer; font-size:12px; color:#dc3545; margin-left: 10px;">👎 Не помогло</button>
-                </div>`;
-            }
+            if (data.debug_meta || data.debug_context) {
+                finalHtml += `<details style="margin-top:8px;"><summary style="cursor:pointer; color:#6c757d;">🐛 Дебаг-информация</summary>`;
 
-            // Рендер ДЕБАГ-ОКНА (Скрыто под спойлером)
-            if (data.debug_context && data.debug_context.length > 0) {
-                let debugHtml = `
-                <details style="margin-top: 10px; font-size: 11px; color: #555; background: #f8f9fa; padding: 6px; border-radius: 6px; border: 1px solid #ddd;">
-                    <summary style="cursor: pointer; font-weight: bold; outline: none;">🐛 Дебаг-информация (Векторный поиск)</summary>
-                    <ul style="margin: 6px 0 0 16px; padding: 0;">`;
-                data.debug_context.forEach(ctx => {
-                    // Score - это дистанция: чем меньше, тем точнее совпадение
-                    debugHtml += `
-                        <li style="margin-bottom: 4px;">
-                            <b>${ctx.title}</b> (Score: <span style="color:${ctx.score < 0.4 ? 'green' : 'red'}">${ctx.score}</span>)<br>
-                            <span style="font-size: 10px; color: #888;">${ctx.text.substring(0, 150)}...</span>
-                        </li>`;
-                });
-                debugHtml += `</ul></details>`;
-                finalHtml += debugHtml;
+                if (data.debug_meta) {
+                    finalHtml += `<div style="font-size:12px; margin-top:6px;">`;
+                    finalHtml += `<b>goal:</b> ${data.debug_meta.goal || ''}<br>`;
+                    finalHtml += `<b>target:</b> ${data.debug_meta.target || ''}<br>`;
+                    finalHtml += `<b>chosen_title:</b> ${data.debug_meta.chosen_title || ''}<br>`;
+                    finalHtml += `<b>chosen_kind:</b> ${data.debug_meta.chosen_kind || ''}<br>`;
+                    finalHtml += `</div>`;
+                }
+
+                if (Array.isArray(data.debug_context) && data.debug_context.length > 0) {
+                    finalHtml += `<div style="font-size:12px; margin-top:8px; display:flex; flex-direction:column; gap:6px;">`;
+                    data.debug_context.forEach(item => {
+                        finalHtml += `
+                            <div style="padding:6px 8px; background:#f8f9fa; border-radius:6px; border-left:3px solid #dee2e6;">
+                                <div><b>${item.title || ''}</b> ${typeof item.score !== 'undefined' ? `(Score: ${item.score})` : ''}</div>
+                                <div style="margin-top:4px; color:#495057;">${(item.text || '').replace(/\n/g, '<br>')}</div>
+                            </div>
+                        `;
+                    });
+                    finalHtml += `</div>`;
+                }
+
+                finalHtml += `</details>`;
             }
 
             addMessageToChat(finalHtml);
@@ -629,11 +775,14 @@ async function getUngradedAssignments() {
 
                 for (const row of rows) {
                     const cells = row.querySelectorAll('th, td');
+
                     if (cells.length >= 2) {
                         const headerText = (cells[0].textContent || "").toLowerCase().trim();
+
                         if (headerText.includes('требуют оценки') || headerText.includes('needs grading') || headerText.includes('ожидают оценки')) {
                             const valueCell = cells[1].cloneNode(true);
                             valueCell.querySelectorAll('.accesshide, .hidden, .sr-only').forEach(el => el.remove());
+
                             const match = valueCell.textContent.match(/(\d+)/);
                             if (match) {
                                 count = parseInt(match[1], 10);
@@ -865,12 +1014,9 @@ setTimeout(async () => {
                     fetchTeacherData(true);
                 }
             });
-        }
-    } else if (path.includes('/mod/') || path.includes('/grade/')) {
-        // Фоновая логика для других страниц
-        if (typeof passiveModuleSync === 'function') passiveModuleSync();
 
-        // Вызываем функцию сбора преподавателей один раз в фоне, чтобы закэшировать
-        if (typeof getCourseTeachers === 'function') getCourseTeachers();
+        }
+    } else if (path.includes('/mod/')) {
+        passiveModuleSync();
     }
 }, 1500);
