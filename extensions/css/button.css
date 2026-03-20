@@ -2,16 +2,16 @@
     position: fixed;
     right: 20px;
     bottom: 85px;
-    width: 68px;
-    height: 68px;
+    width: 60px;
+    height: 60px;
     border-radius: 50%;
-    background: #ffffff;
-    border: 2px solid #000000;
+    background: rgb(255, 255, 255);
+    border: 2px solid rgba(0, 0, 0, 0);
     cursor: pointer;
     z-index: 999999;
     overflow: hidden;
     box-sizing: border-box;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+    box-shadow: none;
     transition: transform 0.2s ease;
     user-select: none;
     -webkit-tap-highlight-color: transparent;
@@ -34,8 +34,8 @@
 }
 
 #moodle-bot-btn img {
-    width: 44px;
-    height: 44px;
+    width: 68px;
+    height: 68px;
     object-fit: contain;
     position: absolute;
     top: 50%;
