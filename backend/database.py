@@ -1,8 +1,9 @@
 import uuid
-from sqlalchemy import create_engine, Column, Integer, Boolean, String, DateTime, Text, text
+from sqlalchemy import create_engine, Column, Integer, Boolean, String, DateTime, Text, text, ForeignKey
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from sqlalchemy.orm import sessionmaker, DeclarativeBase, relationship
 from datetime import datetime, timezone
+
 
 from pgvector.sqlalchemy import Vector
 from config import settings
@@ -45,6 +46,26 @@ class ChatLog(Base):
     ai_reply = Column(Text)
     used_context = Column(Text) # Сохраняем, на какие куски текста ИИ опирался
     is_helpful = Column(Boolean, nullable=True)
+
+class KnowledgeTopic(Base):
+    __tablename__ = "knowledge_topics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), unique=True, index=True)
+    description = Column(Text, nullable=True)
+
+    # Связь с пунктами правил
+    items = relationship("KnowledgeItem", back_populates="topic", cascade="all, delete-orphan")
+
+class KnowledgeItem(Base):
+    __tablename__ = "knowledge_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    topic_id = Column(Integer, ForeignKey("knowledge_topics.id", ondelete="CASCADE"))
+    content = Column(Text, nullable=False)
+    embedding = Column(Vector(384)) # Вектор для поиска
+
+    topic = relationship("KnowledgeTopic", back_populates="items")
 
 with engine.connect() as conn:
     conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))

@@ -8,12 +8,13 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 from config import settings
-from database import SessionLocal, Course, ModuleIndex, ChatLog
+from database import SessionLocal, Course, ModuleIndex, ChatLog, KnowledgeTopic, KnowledgeItem
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Moodle Assistant API")
@@ -105,6 +106,59 @@ class FeedbackRequest(BaseModel):
 # =========================
 # HELPERS
 # =========================
+import os
+
+def sync_knowledge_base():
+    db = SessionLocal()
+    try:
+        file_path = "university_rules.json"
+        if not os.path.exists(file_path):
+            print("Файл university_rules.json не найден. Пропуск инициализации базы знаний.")
+            return
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for topic_data in data:
+            # Ищем, есть ли уже такая тема
+            topic = db.query(KnowledgeTopic).filter(KnowledgeTopic.title == topic_data["title"]).first()
+            if not topic:
+                topic = KnowledgeTopic(title=topic_data["title"], description=topic_data["description"])
+                db.add(topic)
+                db.commit()
+                db.refresh(topic)
+            else:
+                # Обновляем описание, если поменялось
+                topic.description = topic_data["description"]
+                # Удаляем старые пункты, чтобы перезаписать их новыми из файла
+                db.query(KnowledgeItem).filter(KnowledgeItem.topic_id == topic.id).delete()
+                db.commit()
+
+            # Добавляем пункты правил и превращаем их в вектора
+            items = topic_data.get("items", [])
+            if items:
+                # Генерируем вектора для всех пунктов разом
+                embeddings = embedder.encode(items).tolist()
+
+                for text_item, vector in zip(items, embeddings):
+                    new_item = KnowledgeItem(
+                        topic_id=topic.id,
+                        content=text_item,
+                        embedding=vector
+                    )
+                    db.add(new_item)
+
+            db.commit()
+        print("База знаний успешно синхронизирована!")
+    except Exception as e:
+        print(f"Ошибка при синхронизации базы знаний: {e}")
+    finally:
+        db.close()
+
+# Запускаем синхронизацию при старте сервера
+@app.on_event("startup")
+def startup_event():
+    sync_knowledge_base()
 
 def normalize_text(text: str) -> str:
     text = (text or "").lower().strip()
@@ -453,7 +507,7 @@ def route_request(
 
 Верни СТРОГО JSON:
 {{
-  "action": "smalltalk | navigate | course_overview | count_items | find_deadline | check_requirement | answer_from_context | clarify",
+  "action": "smalltalk | navigate | course_overview | count_items | find_deadline | check_requirement | answer_from_context | clarify | global_faq",
   "scope": "course | learning | assignment | quiz | exam | grading | term | generic",
   "use_history": true,
   "use_retrieval": true,
@@ -473,6 +527,7 @@ def route_request(
 - check_requirement если пользователь спрашивает, обязательно ли что-то делать перед другим
 - answer_from_context если нужен ответ по материалам курса
 - clarify если пользователь оспаривает прошлый ответ или нужно переосмыслить предыдущий вопрос
+- global_faq если вопрос про организационные моменты, правила университета, болезнь, пропуски занятий, справки, автоматы, экзамены, пересдачи, дедлайны в целом, а не про учебный материал лекции
 
 Контекст:
 course_title = {ontology.get("course_title", "")}
@@ -507,7 +562,7 @@ last_navigation_target = {last_nav_target}
 
     valid_actions = {
         "smalltalk", "navigate", "course_overview", "count_items",
-        "find_deadline", "check_requirement", "answer_from_context", "clarify"
+        "find_deadline", "check_requirement", "answer_from_context", "clarify", "global_faq"
     }
     valid_scopes = {"course", "learning", "assignment", "quiz", "exam", "grading", "term", "generic"}
 
@@ -656,7 +711,22 @@ def retrieve_candidates(
     score_map = {item["id"]: round(score, 4) for score, item in scored[:20]}
     return candidates, score_map
 
+def retrieve_knowledge_base(db: Session, query: str) -> List[str]:
+    # Превращаем вопрос студента в вектор
+    query_vector = embedder.encode([query])[0].tolist()
+    distance_col = KnowledgeItem.embedding.cosine_distance(query_vector)
 
+    # Находим 3 самых подходящих пункта правил
+    results = db.query(KnowledgeItem, KnowledgeTopic) \
+        .join(KnowledgeTopic, KnowledgeItem.topic_id == KnowledgeTopic.id) \
+        .order_by(distance_col) \
+        .limit(3) \
+        .all()
+
+    snippets = []
+    for item, topic in results:
+        snippets.append(f"Правило из раздела '{topic.title}': {item.content}")
+    return snippets
 # =========================
 # EXECUTORS
 # =========================
@@ -1135,6 +1205,18 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
                 user_msg=user_msg
             )
             debug_context.append({"title": "search_query", "text": search_query, "score": 0})
+    elif route["action"] == "global_faq":
+        search_query = build_search_query(user_msg, data.history, route["query"])
+        kb_rules = retrieve_knowledge_base(db, search_query)
+        execution = {
+            "facts": {
+                "университетские_правила": kb_rules,
+                "важная_инструкция": "Отвечай строго по предоставленным правилам кратко. Если правила выше не описывают ситуацию студента, ответь: 'В общих правилах нет точной информации об этом. Пожалуйста, обратитесь к преподавателю.'"
+            },
+            "targets": []
+        }
+        if kb_rules:
+            debug_context.append({"title": "Найдено в Базе Знаний", "text": "\n".join(kb_rules), "score": 0})
 
     else:
         search_query = build_search_query(user_msg, data.history, route["query"])
