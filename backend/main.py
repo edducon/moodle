@@ -1,9 +1,12 @@
 import re
 import json
 import copy
+import os
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
@@ -37,6 +40,112 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# =========================
+# BASE TEXT HELPERS
+# =========================
+
+def normalize_text(text: str) -> str:
+    text = (text or "").lower().strip()
+    text = text.replace("ё", "е")
+    return re.sub(r"\s+", " ", text)
+
+
+def safe_strip(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def extract_json_from_text(text: str) -> dict:
+    try:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            raw = text[start:end + 1]
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                raw = re.sub(r",\s*}", "}", raw)
+                raw = re.sub(r",\s*\]", "]", raw)
+                return json.loads(raw.replace("\n", " ").replace("\r", ""))
+    except:
+        pass
+    return {}
+
+
+# =========================
+# SEMANTIC ROUTER
+# =========================
+
+class SemanticRouter:
+    def __init__(self, embedder):
+        self.embedder = embedder
+
+        self.intent_examples = {
+            "teacher_info": [
+                "кто преподаватель", "кто ведет курс", "контакты преподавателя",
+                "как связаться с преподавателем", "кто лектор", "чья это дисциплина"
+            ],
+            "navigate": [
+                "с чего начать", "что делать первым", "куда идти",
+                "первое задание", "как начать курс", "какая первая тема"
+            ],
+            "grading": [
+                "как получить оценку", "система оценивания", "критерии оценки",
+                "как сдать экзамен", "как получить зачет", "баллы за задания",
+                "как получить 5", "как получить автомат", "что будет на экзамене"
+            ],
+            "find_deadline": [
+                "когда сдавать", "дедлайн", "срок сдачи", "до какого числа",
+                "горят сроки", "какие ближайшие дедлайны"
+            ],
+            "course_overview": [
+                "из чего состоит курс", "что в курсе", "структура курса",
+                "сколько заданий", "сколько лекций", "о чем этот предмет"
+            ],
+            "global_faq": [
+                "что делать если заболел", "нужна ли справка", "пропустил занятие",
+                "правила университета", "пересдача"
+            ]
+        }
+
+        self.vectors = []
+        self.labels = []
+        self.phrases = []
+
+        for intent, phrases in self.intent_examples.items():
+            vecs = self.embedder.encode(phrases).tolist()
+            for phrase, vec in zip(phrases, vecs):
+                self.vectors.append(vec)
+                self.labels.append(intent)
+                self.phrases.append(phrase)
+
+    def classify(self, query: str, threshold: float = 0.55) -> Tuple[str, str]:
+        q_vec = self.embedder.encode([query])[0]
+
+        similarities = cosine_similarity([q_vec], self.vectors)[0]
+        best_idx = np.argmax(similarities)
+        best_score = similarities[best_idx]
+
+        if best_score >= threshold:
+            best_intent = self.labels[best_idx]
+
+            # Query Expansion
+            intent_scores = [
+                (similarities[i], self.phrases[i])
+                for i in range(len(self.labels)) if self.labels[i] == best_intent
+            ]
+            intent_scores.sort(key=lambda x: x[0], reverse=True)
+
+            expansion = " ".join([phrase for _, phrase in intent_scores[:3]])
+            expanded_query = f"{query} {expansion}"
+
+            return best_intent, expanded_query
+
+        return "answer_from_context", query
+
+
+semantic_router = SemanticRouter(embedder)
 
 
 # =========================
@@ -104,23 +213,46 @@ class FeedbackRequest(BaseModel):
 
 
 # =========================
-# HELPERS
+# MOODLE & DOMAIN HELPERS
 # =========================
-import os
+
+ANAPHORA_MARKERS = [
+    "а дальше", "что потом", "после этого", "а после",
+    "ее", "её", "его", "их", "это", "эту", "этот", "этом", "там",
+    "а как", "как это", "а она", "а оно", "он", "она", "они", "туда"
+]
+
+
+def enrich_query_with_history(user_msg: str, history: List[ChatHistoryItem]) -> str:
+    msg = safe_strip(user_msg)
+    msg_lower = msg.lower()
+
+    padded_msg = f" {msg_lower} "
+    has_anaphora = any(f" {marker} " in padded_msg for marker in ANAPHORA_MARKERS)
+
+    is_short = len(msg.split()) <= 4
+
+    if not (is_short or has_anaphora):
+        return msg
+
+    last_bot_msg = next((h.content for h in reversed(history) if h.role == "assistant"), "")
+    if last_bot_msg:
+        clean_bot_msg = re.sub(r'<[^>]+>', '', last_bot_msg)
+        return f"{clean_bot_msg[:80]} {msg}"
+    return msg
+
 
 def sync_knowledge_base():
     db = SessionLocal()
     try:
         file_path = "university_rules.json"
         if not os.path.exists(file_path):
-            print("Файл university_rules.json не найден. Пропуск инициализации базы знаний.")
             return
 
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         for topic_data in data:
-            # Ищем, есть ли уже такая тема
             topic = db.query(KnowledgeTopic).filter(KnowledgeTopic.title == topic_data["title"]).first()
             if not topic:
                 topic = KnowledgeTopic(title=topic_data["title"], description=topic_data["description"])
@@ -128,89 +260,43 @@ def sync_knowledge_base():
                 db.commit()
                 db.refresh(topic)
             else:
-                # Обновляем описание, если поменялось
                 topic.description = topic_data["description"]
-                # Удаляем старые пункты, чтобы перезаписать их новыми из файла
                 db.query(KnowledgeItem).filter(KnowledgeItem.topic_id == topic.id).delete()
                 db.commit()
 
-            # Добавляем пункты правил и превращаем их в вектора
             items = topic_data.get("items", [])
             if items:
-                # Генерируем вектора для всех пунктов разом
                 embeddings = embedder.encode(items).tolist()
-
                 for text_item, vector in zip(items, embeddings):
-                    new_item = KnowledgeItem(
-                        topic_id=topic.id,
-                        content=text_item,
-                        embedding=vector
-                    )
-                    db.add(new_item)
-
+                    db.add(KnowledgeItem(topic_id=topic.id, content=text_item, embedding=vector))
             db.commit()
-        print("База знаний успешно синхронизирована!")
     except Exception as e:
-        print(f"Ошибка при синхронизации базы знаний: {e}")
+        print(f"Ошибка KB: {e}")
     finally:
         db.close()
 
-# Запускаем синхронизацию при старте сервера
+
 @app.on_event("startup")
 def startup_event():
     sync_knowledge_base()
 
-def normalize_text(text: str) -> str:
-    text = (text or "").lower().strip()
-    text = text.replace("ё", "е")
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def safe_strip(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
-
-
-def extract_json_from_text(text: str) -> dict:
-    try:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1:
-            raw = text[start:end + 1]
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                raw = re.sub(r",\s*}", "}", raw)
-                raw = re.sub(r",\s*\]", "]", raw)
-                raw = raw.replace("\n", " ").replace("\r", "")
-                return json.loads(raw)
-    except Exception:
-        pass
-    return {}
-
 
 def db_module_visible_for_role(mod: ModuleIndex, viewer_role: Optional[str]) -> bool:
     visibility = mod.visibility or {}
-    if viewer_role == "teacher":
-        return True
-    if visibility.get("is_hidden", False) or visibility.get("has_restrictions", False):
-        return False
+    if viewer_role == "teacher": return True
+    if visibility.get("is_hidden", False) or visibility.get("has_restrictions", False): return False
     return True
 
 
 def course_module_visible_for_role(module_data: Dict[str, Any], viewer_role: Optional[str]) -> bool:
     visibility = module_data.get("visibility") or {}
-    if viewer_role == "teacher":
-        return True
-    if visibility.get("is_hidden", False) or visibility.get("has_restrictions", False):
-        return False
+    if viewer_role == "teacher": return True
+    if visibility.get("is_hidden", False) or visibility.get("has_restrictions", False): return False
     return True
 
 
-def split_text_into_chunks(text: str, min_size: int = 200, max_size: int = 1500) -> List[str]:
-    if not text:
-        return []
-
+def split_text_into_chunks(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+    if not text: return []
     text = re.sub(r"Печатать книгу.*?Оглавление", "", text, flags=re.IGNORECASE | re.DOTALL)
     paragraphs = re.split(r"\n+", text.strip())
 
@@ -219,156 +305,102 @@ def split_text_into_chunks(text: str, min_size: int = 200, max_size: int = 1500)
 
     for p in paragraphs:
         p = p.strip()
-        if not p or len(p) < 10:
-            continue
+        if not p or len(p) < 10: continue
 
-        if len(current_chunk) + len(p) + 1 <= max_size:
+        if len(current_chunk) + len(p) + 1 <= chunk_size:
             current_chunk += ("\n" + p if current_chunk else p)
         else:
-            if len(current_chunk) >= min_size:
+            if current_chunk:
                 chunks.append(current_chunk.strip())
-            current_chunk = p
+                overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                match = re.search(r'[.!?]\s+([A-ZА-ЯЁ])', overlap_text)
+                if match: overlap_text = overlap_text[match.end(1) - 1:]
+                current_chunk = overlap_text + "\n" + p
+            else:
+                current_chunk = p
 
     if current_chunk:
         chunks.append(current_chunk.strip())
-
     return chunks
 
 
 def module_kind(title: str, module_type: Optional[str]) -> str:
-    t = normalize_text(title)
-    mt = normalize_text(module_type or "")
-
-    if mt == "quiz":
-        return "quiz"
-    if mt in ("assign", "workshop"):
-        return "assignment"
-    if mt == "forum":
-        return "forum"
-    if mt in ("page", "book", "file", "folder", "url", "lesson", "resource"):
-        return "learning"
-
-    if "экзамен" in t or "тест" in t:
-        return "quiz"
-    if "лаборатор" in t or "практическ" in t or "задани" in t:
-        return "assignment"
-    if "форум" in t or "обсужд" in t:
-        return "forum"
-    if "лекци" in t or "вводн" in t or "литератур" in t:
-        return "learning"
-
+    t, mt = normalize_text(title), normalize_text(module_type or "")
+    if mt == "quiz": return "quiz"
+    if mt in ("assign", "workshop"): return "assignment"
+    if mt == "forum": return "forum"
+    if mt in ("page", "book", "file", "folder", "url", "lesson", "resource"): return "learning"
+    if "экзамен" in t or "тест" in t: return "quiz"
+    if "лаборатор" in t or "практическ" in t or "задани" in t: return "assignment"
+    if "форум" in t or "обсужд" in t: return "forum"
+    if "лекци" in t or "вводн" in t or "литератур" in t: return "learning"
     return "other"
 
 
 def parse_order_from_title(title: str) -> Tuple[int, int, int]:
     t = normalize_text(title)
-
     m = re.search(r"(\d+)\.(\d+)", t)
-    if m:
-        return (int(m.group(1)), int(m.group(2)), 0)
-
+    if m: return (int(m.group(1)), int(m.group(2)), 0)
     m = re.search(r"лекц\w*\s*№\s*(\d+)", t)
-    if m:
-        return (999, int(m.group(1)), 1)
-
+    if m: return (999, int(m.group(1)), 1)
     m = re.search(r"лаборат\w*\s*работ\w*\s*№\s*(\d+)", t)
-    if m:
-        return (999, int(m.group(1)), 2)
-
+    if m: return (999, int(m.group(1)), 2)
     m = re.search(r"практическ\w*\s*(?:заняти\w*|работ\w*)\s*№\s*(\d+)", t)
-    if m:
-        return (999, int(m.group(1)), 2)
-
+    if m: return (999, int(m.group(1)), 2)
     m = re.search(r"тест\w*\s*№\s*(\d+)", t)
-    if m:
-        return (999, int(m.group(1)), 3)
-
+    if m: return (999, int(m.group(1)), 3)
     return (9999, 9999, 9999)
 
 
 def build_course_modules(db_course: Course, viewer_role: str) -> List[Dict[str, Any]]:
     result = []
     sections = db_course.content or []
-
     for s_idx, sec in enumerate(sections):
         for m_idx, mod in enumerate(sec.get("modules", [])):
-            if not course_module_visible_for_role(mod, viewer_role):
-                continue
-
+            if not course_module_visible_for_role(mod, viewer_role): continue
             title = mod.get("title", "Без названия")
             module_type = mod.get("type")
             result.append({
-                "moodle_id": mod.get("moodle_id"),
-                "title": title,
-                "url": mod.get("url", ""),
-                "module_type": module_type,
-                "kind": module_kind(title, module_type),
-                "section_index": s_idx,
-                "module_index": m_idx,
-                "order_key": parse_order_from_title(title),
+                "moodle_id": mod.get("moodle_id"), "title": title, "url": mod.get("url", ""),
+                "module_type": module_type, "kind": module_kind(title, module_type),
+                "section_index": s_idx, "module_index": m_idx, "order_key": parse_order_from_title(title),
                 "visibility": mod.get("visibility") or {}
             })
-
     return result
 
 
 def order_modules(course_modules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return sorted(
-        course_modules,
-        key=lambda m: (m["order_key"], m["section_index"], m["module_index"])
-    )
-
-
-def extract_last_user_message(history: List[ChatHistoryItem]) -> str:
-    for item in reversed(history):
-        if item.role == "user" and safe_strip(item.content):
-            return safe_strip(item.content)
-    return ""
+    return sorted(course_modules, key=lambda m: (m["order_key"], m["section_index"], m["module_index"]))
 
 
 def extract_last_bot_navigation_target(history: List[ChatHistoryItem]) -> str:
     for item in reversed(history):
-        if item.role != "assistant":
-            continue
+        if item.role != "assistant": continue
         text = item.content or ""
-
         m = re.search(r'["«](.+?)["»]', text)
-        if m:
-            return m.group(1).strip()
-
+        if m: return m.group(1).strip()
         m = re.search(r"откройте\s+(?:сначала\s+)?(.+?)(?:\.|$)", text, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
+        if m: return m.group(1).strip()
 
+        m = re.search(
+            r"(лекци[ия]\s*№?\s*\d+|лаборатор\w+\s*работ\w*\s*№?\s*\d+|практическ\w+\s*\w*\s*№?\s*\d+|тем[аы]\s*№?\s*\d+)",
+            text, flags=re.IGNORECASE)
+        if m: return m.group(1).strip()
     return ""
 
 
 def get_next_module_after(course_modules: List[Dict[str, Any]], current_title: str) -> Optional[Dict[str, Any]]:
-    if not current_title:
-        return None
-
+    if not current_title: return None
     ordered = order_modules(course_modules)
     current_norm = normalize_text(current_title)
-
-    idx = None
-    for i, item in enumerate(ordered):
-        if normalize_text(item["title"]) == current_norm:
-            idx = i
-            break
-
-    if idx is None:
-        return None
-
-    if idx + 1 < len(ordered):
-        return ordered[idx + 1]
-
+    idx = next((i for i, item in enumerate(ordered) if normalize_text(item["title"]) == current_norm), None)
+    if idx is not None and idx + 1 < len(ordered): return ordered[idx + 1]
     return None
 
 
 def choose_default_start(course_modules: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     ordered = order_modules(course_modules)
-    if not ordered:
-        return None
+    if not ordered: return None
 
     def score(m: Dict[str, Any]) -> Tuple[int, Tuple[int, int, int], int, int]:
         title = normalize_text(m["title"])
@@ -386,347 +418,71 @@ def choose_default_start(course_modules: List[Dict[str, Any]]) -> Optional[Dict[
     return sorted(ordered, key=score)[0]
 
 
-def build_course_ontology(course_modules: List[Dict[str, Any]], deadlines: List[DeadlineItem], course_title: str) -> Dict[str, Any]:
+def build_course_ontology(course_modules: List[Dict[str, Any]], deadlines: List[DeadlineItem], course_title: str) -> \
+Dict[str, Any]:
     ordered = order_modules(course_modules)
-
-    learning = [m for m in ordered if m["kind"] == "learning"]
-    assignments = [m for m in ordered if m["kind"] == "assignment"]
-    quizzes = [m for m in ordered if m["kind"] == "quiz"]
-    forums = [m for m in ordered if m["kind"] == "forum"]
-    start_module = choose_default_start(course_modules)
-
     return {
         "course_title": course_title,
         "counts": {
-            "all": len(ordered),
-            "learning": len(learning),
-            "assignments": len(assignments),
-            "quizzes": len(quizzes),
-            "forums": len(forums),
+            "all": len(ordered), "learning": len([m for m in ordered if m["kind"] == "learning"]),
+            "assignments": len([m for m in ordered if m["kind"] == "assignment"]),
+            "quizzes": len([m for m in ordered if m["kind"] == "quiz"]),
+            "forums": len([m for m in ordered if m["kind"] == "forum"]),
         },
-        "start_module": start_module,
-        "ordered_titles": [m["title"] for m in ordered[:30]],
+        "start_module": choose_default_start(course_modules),
         "deadlines": deadlines,
     }
 
 
 # =========================
-# RESTRICTIONS PARSER
+# ROUTING & RETRIEVAL
 # =========================
 
-def restriction_type_from_text(text: str) -> str:
-    t = normalize_text(text)
+def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bool) -> Dict[str, Any]:
+    intent, search_query = semantic_router.classify(enriched_msg)
+    route = {"action": intent, "scope": "generic", "query": search_query}
 
-    if "с или после" in t or t.startswith("до ") or " до " in t:
-        return "date"
-    if "должен быть отмечен как выполненный" in t or "выполненн" in t:
-        return "completion"
-    if "больше необходимой оценки" in t or "проходной балл" in t or "оценк" in t:
-        return "grade"
-    if "провести за изучением курса" in t or "сек." in t or "секунд" in t:
-        return "time_spent"
+    if intent == "find_deadline" and not has_deadlines:
+        route["action"] = "answer_from_context"
+    elif intent == "grading":
+        route["action"] = "answer_from_context"
 
-    return "other"
+    return route
 
 
-def parse_course_page_restrictions(page_html: str) -> List[Dict[str, Any]]:
-    if not page_html or "<html" not in page_html.lower():
-        return []
-
-    soup = BeautifulSoup(page_html, "html.parser")
-    results = []
-    seen = set()
-
-    activity_nodes = soup.select("li.activity, li.activity-wrapper, li[id^='module-']")
-    for node in activity_nodes:
-        module_id = node.get("id", "").strip()
-
-        title_tag = (
-            node.select_one("[data-for='section_title']")
-            or node.select_one(".activityname")
-            or node.select_one(".instancename")
-            or node.select_one("a[href*='/mod/']")
-        )
-        title = safe_strip(title_tag.get_text(" ", strip=True) if title_tag else "")
-
-        restriction_box = node.select_one(".availabilityinfo.isrestricted")
-        restrictions = []
-
-        if restriction_box:
-            lis = restriction_box.select("ul[data-region='availability-multiple'] li")
-            if lis:
-                for li in lis:
-                    txt = safe_strip(li.get_text(" ", strip=True))
-                    if txt:
-                        restrictions.append({
-                            "text": txt,
-                            "type": restriction_type_from_text(txt)
-                        })
-            else:
-                txt = safe_strip(restriction_box.get_text(" ", strip=True))
-                if txt:
-                    restrictions.append({
-                        "text": txt,
-                        "type": restriction_type_from_text(txt)
-                    })
-
-        key = (module_id, title)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if module_id or title or restrictions:
-            results.append({
-                "module_id": module_id,
-                "title": title,
-                "is_restricted": bool(restriction_box),
-                "restrictions": restrictions
-            })
-
-    return results
-
-
-# =========================
-# ROUTER
-# =========================
-
-def route_request(
-    user_msg: str,
-    history: List[ChatHistoryItem],
-    ontology: Dict[str, Any],
-    has_deadlines: bool,
-    has_page_context: bool
-) -> Dict[str, Any]:
-    history_text = "\n".join([f"{h.role}: {h.content}" for h in history[-6:]])
-    last_user = extract_last_user_message(history[:-1]) if len(history) > 1 else ""
-    last_nav_target = extract_last_bot_navigation_target(history)
-
-    prompt = f"""
-Ты роутер запросов для помощника по курсу.
-Нельзя отвечать пользователю. Нужно только выбрать действие.
-
-Верни СТРОГО JSON:
-{{
-  "action": "smalltalk | navigate | course_overview | count_items | find_deadline | check_requirement | answer_from_context | clarify | global_faq",
-  "scope": "course | learning | assignment | quiz | exam | grading | term | generic",
-  "use_history": true,
-  "use_retrieval": true,
-  "use_structure": false,
-  "use_deadlines": false,
-  "use_restrictions": false,
-  "query": "что искать по смыслу",
-  "reason": "краткое техническое объяснение"
-}}
-
-Правила:
-- smalltalk только если это в основном беседа, реакция или тональная реплика
-- navigate если пользователь хочет понять с чего начать, что дальше, куда перейти
-- course_overview если пользователь спрашивает о курсе в целом
-- count_items если пользователь спрашивает сколько чего в курсе
-- find_deadline если пользователь спрашивает про сроки и дедлайны
-- check_requirement если пользователь спрашивает, обязательно ли что-то делать перед другим
-- answer_from_context если нужен ответ по материалам курса
-- clarify если пользователь оспаривает прошлый ответ или нужно переосмыслить предыдущий вопрос
-- global_faq если вопрос про организационные моменты, правила университета, болезнь, пропуски занятий, справки, автоматы, экзамены, пересдачи, дедлайны в целом, а не про учебный материал лекции
-
-Контекст:
-course_title = {ontology.get("course_title", "")}
-counts = {json.dumps(ontology.get("counts", {}), ensure_ascii=False)}
-has_deadlines = {has_deadlines}
-has_page_context = {has_page_context}
-last_user_question = {last_user}
-last_navigation_target = {last_nav_target}
-
-История:
-{history_text}
-
-Текущий запрос:
-{user_msg}
-"""
-
-    try:
-        resp = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            response_format={"type": "json_object"}
-        )
-        data = extract_json_from_text(resp.choices[0].message.content)
-    except Exception:
-        data = {}
-
-    action = safe_strip(data.get("action", "answer_from_context")).lower()
-    scope = safe_strip(data.get("scope", "generic")).lower()
-    query = safe_strip(data.get("query", user_msg))
-    reason = safe_strip(data.get("reason", "router_fallback"))
-
-    valid_actions = {
-        "smalltalk", "navigate", "course_overview", "count_items",
-        "find_deadline", "check_requirement", "answer_from_context", "clarify", "global_faq"
-    }
-    valid_scopes = {"course", "learning", "assignment", "quiz", "exam", "grading", "term", "generic"}
-
-    if action not in valid_actions:
-        action = "answer_from_context"
-    if scope not in valid_scopes:
-        scope = "generic"
-
-    return {
-        "action": action,
-        "scope": scope,
-        "use_history": bool(data.get("use_history", True)),
-        "use_retrieval": bool(data.get("use_retrieval", action in {"answer_from_context", "clarify"})),
-        "use_structure": bool(data.get("use_structure", action in {"navigate", "course_overview", "count_items"})),
-        "use_deadlines": bool(data.get("use_deadlines", action == "find_deadline")),
-        "use_restrictions": bool(data.get("use_restrictions", action == "check_requirement")),
-        "query": query or user_msg,
-        "reason": reason or "router_fallback",
-    }
-
-
-# =========================
-# RETRIEVAL
-# =========================
-
-def build_search_query(user_msg: str, history: List[ChatHistoryItem], routed_query: str) -> str:
-    history_text = "\n".join([f"{h.role}: {h.content}" for h in history[-4:]])
-
-    prompt = f"""
-Собери короткий поисковый запрос по материалам курса.
-Верни только JSON:
-
-{{
-  "search_query": "..."
-}}
-
-История:
-{history_text}
-
-Текущий вопрос:
-{user_msg}
-
-Смысл вопроса:
-{routed_query}
-"""
-    try:
-        r = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            response_format={"type": "json_object"}
-        )
-        data = extract_json_from_text(r.choices[0].message.content)
-        return safe_strip(data.get("search_query", routed_query or user_msg)) or user_msg
-    except Exception:
-        return routed_query or user_msg
-
-
-def retrieve_candidates(
-    db: Session,
-    course_id: str,
-    viewer_role: str,
-    search_query: str,
-    scope: str,
-    user_msg: str
-) -> Tuple[List[Dict[str, Any]], Dict[int, float]]:
-    search_query_norm = normalize_text(search_query)
-    keywords = set(re.sub(r"[^\w\s-]", "", search_query_norm).split())
-
+def retrieve_candidates(db: Session, course_id: str, viewer_role: str, search_query: str) -> Tuple[
+    List[Dict[str, Any]], Dict[str, float]]:
     query_vector = embedder.encode([search_query])[0].tolist()
     distance_col = ModuleIndex.embedding.cosine_distance(query_vector)
 
     raw_results = db.query(ModuleIndex, distance_col.label("distance")).filter(
         ModuleIndex.course_id == course_id
-    ).order_by(distance_col).limit(120).all()
+    ).order_by(distance_col).limit(15).all()
 
     scored = []
-
     for c, dist in raw_results:
-        if not db_module_visible_for_role(c, viewer_role):
-            continue
-
-        title_lower = normalize_text(c.title or "")
-        text_lower = normalize_text(c.content_text or "")
-        kind = module_kind(c.title or "", c.module_type)
-
-        bonus = 0.0
-        penalty = 0.0
-
-        for kw in keywords:
-            if len(kw) < 4:
-                continue
-            root = kw[:-2] if len(kw) > 4 else kw
-            if root in title_lower:
-                bonus += 0.18
-            if root in text_lower:
-                bonus += 0.10
-
-        # Generic scope biases, not phrase dictionaries.
-        if scope == "term":
-            if kind == "learning":
-                bonus += 0.60
-            if kind in {"forum"}:
-                penalty += 0.70
-            if "система оценки" in title_lower:
-                penalty += 0.80
-
-        elif scope == "grading":
-            if "оценк" in title_lower or "балл" in text_lower or "зач" in text_lower or "экзам" in text_lower:
-                bonus += 0.45
-            if kind == "forum":
-                penalty += 0.35
-
-        elif scope == "assignment":
-            if kind == "assignment":
-                bonus += 0.60
-            if kind == "forum":
-                penalty += 0.90
-            if kind == "quiz":
-                penalty += 0.70
-
-        elif scope == "learning":
-            if kind == "learning":
-                bonus += 0.45
-            if kind == "forum":
-                penalty += 0.40
-
-        elif scope == "exam":
-            if "экзам" in title_lower or ("итог" in title_lower and kind == "quiz"):
-                bonus += 0.75
-
-        final_score = dist - bonus + penalty
-
-        scored.append((final_score, {
-            "id": c.id,
-            "moodle_id": c.moodle_id,
-            "url": c.url,
-            "title": c.title,
-            "kind": kind,
-            "content_text": c.content_text,
-            "module_type": c.module_type,
+        if not db_module_visible_for_role(c, viewer_role): continue
+        scored.append((dist, {
+            "id": str(c.id), "moodle_id": c.moodle_id, "url": c.url,
+            "title": c.title, "kind": module_kind(c.title or "", c.module_type),
+            "content_text": c.content_text, "module_type": c.module_type,
         }))
 
     scored.sort(key=lambda x: x[0])
     candidates = [item for _, item in scored[:8]]
-    score_map = {item["id"]: round(score, 4) for score, item in scored[:20]}
+    score_map = {item["id"]: round(score, 4) for score, item in scored[:15]}
     return candidates, score_map
 
+
 def retrieve_knowledge_base(db: Session, query: str) -> List[str]:
-    # Превращаем вопрос студента в вектор
     query_vector = embedder.encode([query])[0].tolist()
     distance_col = KnowledgeItem.embedding.cosine_distance(query_vector)
+    results = db.query(KnowledgeItem, KnowledgeTopic).join(KnowledgeTopic,
+                                                           KnowledgeItem.topic_id == KnowledgeTopic.id).order_by(
+        distance_col).limit(3).all()
+    return [f"Правило из раздела '{topic.title}': {item.content}" for item, topic in results]
 
-    # Находим 3 самых подходящих пункта правил
-    results = db.query(KnowledgeItem, KnowledgeTopic) \
-        .join(KnowledgeTopic, KnowledgeItem.topic_id == KnowledgeTopic.id) \
-        .order_by(distance_col) \
-        .limit(3) \
-        .all()
 
-    snippets = []
-    for item, topic in results:
-        snippets.append(f"Правило из раздела '{topic.title}': {item.content}")
-    return snippets
 # =========================
 # EXECUTORS
 # =========================
@@ -735,255 +491,93 @@ def exec_navigation(course_modules: List[Dict[str, Any]], history: List[ChatHist
     last_target = extract_last_bot_navigation_target(history)
     if last_target:
         nxt = get_next_module_after(course_modules, last_target)
-        if nxt:
-            return {
-                "facts": {
-                    "mode": "next_step",
-                    "current_target": last_target,
-                    "next_module": nxt
-                },
-                "targets": [nxt]
-            }
-
+        if nxt: return {"facts": {"mode": "next_step", "current_target": last_target, "next_module": nxt},
+                        "targets": [nxt]}
     start = choose_default_start(course_modules)
-    return {
-        "facts": {
-            "mode": "start",
-            "start_module": start
-        },
-        "targets": [start] if start else []
-    }
+    return {"facts": {"mode": "start", "start_module": start}, "targets": [start] if start else []}
 
 
 def exec_course_overview(ontology: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "facts": {
-            "course_title": ontology.get("course_title", ""),
-            "counts": ontology.get("counts", {}),
-            "ordered_titles": ontology.get("ordered_titles", [])[:8],
-            "start_module": ontology.get("start_module")
-        },
-        "targets": [ontology.get("start_module")] if ontology.get("start_module") else []
-    }
+    return {"facts": {"course_title": ontology.get("course_title", ""), "counts": ontology.get("counts", {}),
+                      "start_module": ontology.get("start_module")},
+            "targets": [ontology.get("start_module")] if ontology.get("start_module") else []}
 
 
-def exec_count_items(course_modules: List[Dict[str, Any]], scope: str) -> Dict[str, Any]:
-    if scope == "assignment":
-        items = [m for m in course_modules if m["kind"] == "assignment"]
-    elif scope == "learning":
-        items = [m for m in course_modules if m["kind"] == "learning"]
-    elif scope == "quiz":
-        items = [m for m in course_modules if m["kind"] == "quiz"]
-    else:
-        items = course_modules
-
-    return {
-        "facts": {
-            "scope": scope,
-            "count": len(items),
-            "sample_titles": [m["title"] for m in items[:10]]
-        },
-        "targets": []
-    }
+def exec_deadlines(deadlines: List[DeadlineItem], scope: str) -> Dict[str, Any]:
+    return {"facts": {"has_deadlines": bool(deadlines), "deadlines": deadlines[:10], "scope": scope}, "targets": []}
 
 
-def exec_deadlines(deadlines: List[DeadlineItem], scope: str, user_msg: str) -> Dict[str, Any]:
-    if not deadlines:
-        return {
-            "facts": {
-                "has_deadlines": False,
-                "deadlines": []
-            },
-            "targets": []
-        }
-
-    filtered = deadlines
-    if scope == "assignment":
-        filtered = [
-            d for d in deadlines
-            if "лаб" in normalize_text(d.title) or "практическ" in normalize_text(d.title)
-        ] or deadlines
-
-    return {
-        "facts": {
-            "has_deadlines": True,
-            "deadlines": filtered[:10],
-            "scope": scope
-        },
-        "targets": []
-    }
-
-
-def exec_requirement_check(page_context: str, user_msg: str) -> Dict[str, Any]:
-    restrictions = parse_course_page_restrictions(page_context or "")
-    matched = None
-
-    if restrictions:
-        q = normalize_text(user_msg)
-        best = []
-        for item in restrictions:
-            title = normalize_text(item.get("title", ""))
-            score = 0
-            if title and title in q:
-                score += 5
-            if "лаб" in q and ("лаб" in title or "практическ" in title):
-                score += 3
-            if "тест" in q and "тест" in title:
-                score += 3
-            if "лекц" in q and "лекц" in title:
-                score += 3
-            if item.get("is_restricted"):
-                score += 2
-            if score > 0:
-                best.append((score, item))
-
-        if best:
-            best.sort(key=lambda x: x[0], reverse=True)
-            matched = best[0][1]
-        elif len(restrictions) == 1:
-            matched = restrictions[0]
-
-    return {
-        "facts": {
-            "has_restrictions": bool(restrictions),
-            "matched_restriction": matched,
-            "restriction_count": len(restrictions)
-        },
-        "targets": []
-    }
-
-
-def exec_answer_from_context(
-    db: Session,
-    course_id: str,
-    viewer_role: str,
-    query: str,
-    scope: str,
-    user_msg: str
-) -> Dict[str, Any]:
-    candidates, score_map = retrieve_candidates(
-        db=db,
-        course_id=course_id,
-        viewer_role=viewer_role,
-        search_query=query,
-        scope=scope,
-        user_msg=user_msg
-    )
-    return {
-        "facts": {
-            "query": query,
-            "candidates": candidates
-        },
-        "targets": candidates[:1],
-        "score_map": score_map
-    }
+def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str) -> Dict[str, Any]:
+    candidates, score_map = retrieve_candidates(db=db, course_id=course_id, viewer_role=viewer_role, search_query=query)
+    return {"facts": {"query": query, "candidates": candidates[:3]}, "targets": candidates[:1], "score_map": score_map}
 
 
 # =========================
-# RESPONSE GENERATOR
+# GENERATOR
 # =========================
 
 def generate_response(
-    user_msg: str,
-    history: List[ChatHistoryItem],
-    action: str,
-    scope: str,
-    execution: Dict[str, Any],
-    ontology: Dict[str, Any],
-    teachers: str,
-    grades: str,
-    assign_status: str
+        user_msg: str,
+        history: List[ChatHistoryItem],
+        action: str,
+        execution: Dict[str, Any],
+        ontology: Dict[str, Any]
 ) -> Dict[str, Any]:
     facts = execution.get("facts", {})
     targets = [t for t in execution.get("targets", []) if t]
 
     prompt = f"""
-Ты помощник по курсу Moodle.
-Тебе нужно ответить естественно, в тоне пользователя, но культурно.
-Не используй заготовленные канцелярские фразы.
-Не выдумывай факты. Используй только данные ниже.
-Если данных недостаточно, прямо скажи об этом.
-Если есть target, можно мягко сослаться на него по названию.
-Не упоминай внутренние слова вроде "роутер", "контекст", "метаданные".
+Ты интеллектуальный помощник для студентов курса в Moodle.
+Отвечай вежливо, естественно и полезно.
+Используй ТОЛЬКО переданные факты, ничего не придумывай.
+Если по фактам нет нужной информации, честно скажи, что не обладаешь такими данными.
+Если предлагаешь куда-то перейти, мягко сошлись на это.
 
 Верни СТРОГО JSON:
 {{
-  "reply": "..."
+  "reply": "твой ответ студенту"
 }}
 
-Текущий action: {action}
-Текущий scope: {scope}
+--- КОНТЕКСТ ---
+Запрос: {user_msg}
+Курс: {ontology.get("course_title", "Без названия")}
 
-История:
-{chr(10).join([f"{h.role}: {h.content}" for h in history[-6:]])}
-
-Запрос пользователя:
-{user_msg}
-
-Курс:
-{json.dumps(ontology, ensure_ascii=False)}
-
-Преподаватели:
-{teachers or ""}
-
-Оценки:
-{grades or ""}
-
-Статус заданий:
-{assign_status or ""}
-
-Факты для ответа:
+Найденные факты из базы для ответа:
 {json.dumps(facts, ensure_ascii=False, default=str)}
-
-Targets:
-{json.dumps([{"title": t.get("title"), "url": t.get("url"), "kind": t.get("kind")} for t in targets], ensure_ascii=False)}
 """
-
     try:
         resp = client.chat.completions.create(
             model=settings.LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.35,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            extra_body={"options": {"num_ctx": 8192}}
         )
-        data = extract_json_from_text(resp.choices[0].message.content)
+
+        raw_content = resp.choices[0].message.content.strip()
+        data = extract_json_from_text(raw_content)
         reply = safe_strip(data.get("reply", ""))
+
+        if not reply and raw_content:
+            if not raw_content.startswith("{"):
+                reply = raw_content
+
         if reply:
             return {"reply": reply, "targets": targets}
-    except Exception:
-        pass
 
-    # Minimal safe fallback, only if LLM generation fails completely.
-    if action == "course_overview":
-        title = facts.get("course_title", "Курс")
-        start = facts.get("start_module")
-        reply = f'{title}: можно начать с "{start["title"]}".' if start else title
-    elif action == "count_items":
-        reply = f'Количество элементов: {facts.get("count", 0)}.'
-    elif action == "find_deadline":
-        if facts.get("has_deadlines"):
-            reply = "\n".join([f'{d.title}: до {d.due_date}' for d in facts.get("deadlines", [])[:5]])
-        else:
-            reply = "Я не вижу извлечённых дедлайнов в текущих данных."
-    elif action == "navigate":
-        if targets:
-            reply = f'Откройте "{targets[0]["title"]}".'
-        else:
-            reply = "Не удалось выбрать следующий материал."
-    elif action == "check_requirement":
-        matched = facts.get("matched_restriction")
-        if matched:
-            texts = "; ".join([r["text"] for r in matched.get("restrictions", [])])
-            reply = f'Для "{matched.get("title", "этого элемента")}" вижу ограничение: {texts}.'
-        else:
-            reply = "Явного технического ограничения по текущим данным не видно."
-    else:
-        if targets:
-            reply = f'Ближе всего по теме выглядит "{targets[0]["title"]}".'
-        else:
-            reply = "Не удалось собрать надёжный ответ по текущим данным."
+    except Exception as e:
+        print(f"Ошибка LLM-генерации: {e}")
+        if 'resp' in locals() and resp.choices:
+            raw = resp.choices[0].message.content.strip()
+            recovered = extract_json_from_text(raw)
+            if recovered and recovered.get("reply"):
+                return {"reply": recovered["reply"], "targets": targets}
+            if not raw.startswith("{"):
+                return {"reply": raw, "targets": targets}
 
-    return {"reply": reply, "targets": targets}
+    return {
+        "reply": "Произошла техническая ошибка при формулировании ответа. Пожалуйста, попробуйте спросить чуть иначе.",
+        "targets": targets}
 
 
 # =========================
@@ -993,7 +587,6 @@ Targets:
 @app.post("/api/course/sync")
 def sync_course(data: CourseData, db: Session = Depends(get_db)):
     db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
-
     is_new = False
     if db_course:
         db_course.title = data.title
@@ -1003,65 +596,37 @@ def sync_course(data: CourseData, db: Session = Depends(get_db)):
         db_course = Course(course_id=data.course_id, title=data.title, content=data.sections)
         db.add(db_course)
         is_new = True
-
     db.commit()
-
-    # ПРОВЕРЯЕМ, ЕСТЬ ЛИ В БАЗЕ ЭЛЕМЕНТЫ ЭТОГО КУРСА
     indexed_count = db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count()
-    needs_sync = is_new or (indexed_count == 0)
-
-    # Отправляем фронтенду сигнал, нужно ли запускать паука
-    return {"status": "success", "needs_initial_sync": needs_sync}
+    return {"status": "success", "needs_initial_sync": is_new or (indexed_count == 0)}
 
 
 @app.post("/api/module/update")
 def update_module_content(data: ModuleUpdateData, db: Session = Depends(get_db)):
     db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
-    if not db_course:
-        return {"status": "error", "reason": "course_not_found"}
-
+    if not db_course: return {"status": "error", "reason": "course_not_found"}
     sections = copy.deepcopy(db_course.content)
-    mod_title = "Без названия"
-    mod_type = data.module_type
-    mod_visibility = data.visibility or {}
-    updated = False
-
+    mod_title, mod_type = "Без названия", data.module_type
     for sec in sections:
         for mod in sec.get("modules", []):
             if mod.get("moodle_id") == data.moodle_id:
-                mod["content_text"] = "Текст обновлен и разбит на чанки"
+                mod["content_text"] = "Текст обновлен"
                 mod["url"] = data.url
-                mod["visibility"] = mod_visibility
+                mod["visibility"] = data.visibility or {}
                 mod_title = mod.get("title", "Без названия")
                 mod_type = mod.get("type", mod_type)
-                updated = True
                 break
-        if updated:
-            break
-
     db_course.content = sections
     db_course.last_updated = datetime.now(timezone.utc)
-
     db.query(ModuleIndex).filter(ModuleIndex.moodle_id == data.moodle_id).delete()
 
-    chunks = split_text_into_chunks(data.content_text)
-    if not chunks:
-        chunks = ["(Нет текстового содержимого)"]
-
+    chunks = split_text_into_chunks(data.content_text) or ["(Нет текста)"]
     vectors = embedder.encode([f"{mod_title}\n{chunk}" for chunk in chunks]).tolist()
-
     for chunk, vector in zip(chunks, vectors):
         db.add(ModuleIndex(
-            moodle_id=data.moodle_id,
-            course_id=data.course_id,
-            module_type=mod_type,
-            title=mod_title,
-            content_text=chunk,
-            url=data.url,
-            visibility=mod_visibility,
-            embedding=vector
+            moodle_id=data.moodle_id, course_id=data.course_id, module_type=mod_type,
+            title=mod_title, content_text=chunk, url=data.url, visibility=data.visibility or {}, embedding=vector
         ))
-
     db.commit()
     return {"status": "success"}
 
@@ -1070,240 +635,109 @@ def update_module_content(data: ModuleUpdateData, db: Session = Depends(get_db))
 def bulk_update_modules(data: BulkModuleUpdateData, db: Session = Depends(get_db)):
     moodle_ids = [m.moodle_id for m in data.modules]
     if moodle_ids:
-        db.query(ModuleIndex).filter(
-            ModuleIndex.course_id == data.course_id,
-            ModuleIndex.moodle_id.in_(moodle_ids)
-        ).delete(synchronize_session=False)
+        db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id,
+                                     ModuleIndex.moodle_id.in_(moodle_ids)).delete(synchronize_session=False)
 
     texts_to_embed, chunk_metadata = [], []
-
-    for incoming_mod in data.modules:
-        mod_title = incoming_mod.title if incoming_mod.title else "Без названия"
-        mod_type = incoming_mod.module_type
-        mod_visibility = incoming_mod.visibility or {}
-        chunks = split_text_into_chunks(incoming_mod.content_text)
-
-        if not chunks:
-            continue
-
+    for inc_mod in data.modules:
+        chunks = split_text_into_chunks(inc_mod.content_text)
+        if not chunks: continue
         for chunk in chunks:
-            texts_to_embed.append(f"{mod_title}\n{chunk}")
-            chunk_metadata.append({
-                "moodle_id": incoming_mod.moodle_id,
-                "module_type": mod_type,
-                "title": mod_title,
-                "content_text": chunk,
-                "url": incoming_mod.url,
-                "visibility": mod_visibility
-            })
+            texts_to_embed.append(f"{inc_mod.title or 'Без названия'}\n{chunk}")
+            chunk_metadata.append(
+                {"moodle_id": inc_mod.moodle_id, "module_type": inc_mod.module_type, "title": inc_mod.title,
+                 "content_text": chunk, "url": inc_mod.url, "visibility": inc_mod.visibility or {}})
 
     if texts_to_embed:
         for i in range(0, len(texts_to_embed), 16):
-            batch_texts = texts_to_embed[i:i + 16]
-            vectors = embedder.encode(batch_texts).tolist()
-
+            batch = texts_to_embed[i:i + 16]
+            vectors = embedder.encode(batch).tolist()
             for j, vector in enumerate(vectors):
                 meta = chunk_metadata[i + j]
                 db.add(ModuleIndex(
-                    moodle_id=meta["moodle_id"],
-                    course_id=data.course_id,
-                    module_type=meta["module_type"],
-                    title=meta["title"],
-                    content_text=meta["content_text"],
-                    url=meta["url"],
-                    visibility=meta["visibility"],
-                    embedding=vector
+                    moodle_id=meta["moodle_id"], course_id=data.course_id, module_type=meta["module_type"],
+                    title=meta["title"], content_text=meta["content_text"], url=meta["url"],
+                    visibility=meta["visibility"], embedding=vector
                 ))
-
             db.commit()
-
-    return {"status": "success", "updated_chunks": len(texts_to_embed)}
+    return {"status": "success"}
 
 
 @app.post("/api/smart-search")
 def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
-    indexed_count = db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count()
-    if indexed_count == 0:
+    if db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count() == 0:
         return {"reply": "Курс еще не проиндексирован.", "targets": []}
 
     db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
-    if not db_course:
-        return {"reply": "Курс не найден.", "targets": []}
+    if not db_course: return {"reply": "Курс не найден.", "targets": []}
 
     user_msg = safe_strip(data.message)
     viewer_role = data.viewer_role or "student"
-
     course_modules = build_course_modules(db_course, viewer_role)
-    ontology = build_course_ontology(
-        course_modules=course_modules,
-        deadlines=data.deadlines,
-        course_title=data.course_title or db_course.title
-    )
+    ontology = build_course_ontology(course_modules, data.deadlines, data.course_title or db_course.title)
 
-    route = route_request(
-        user_msg=user_msg,
-        history=data.history,
-        ontology=ontology,
-        has_deadlines=bool(data.deadlines),
-        has_page_context=bool(data.page_context)
-    )
+    enriched_msg = enrich_query_with_history(user_msg, data.history)
+    route = route_request(enriched_msg, ontology, bool(data.deadlines))
 
     debug_context = [
         {"title": "action", "text": route["action"], "score": 0},
-        {"title": "scope", "text": route["scope"], "score": 0},
-        {"title": "router_query", "text": route["query"], "score": 0},
-        {"title": "router_reason", "text": route["reason"], "score": 0},
+        {"title": "router_query (expanded)", "text": route["query"], "score": 0},
+        {"title": "enriched_input", "text": enriched_msg, "score": 0}
     ]
 
-    execution: Dict[str, Any]
+    execution: Dict[str, Any] = {"facts": {}, "targets": []}
 
-    if route["action"] == "navigate":
-        execution = exec_navigation(course_modules, data.history)
-
+    if route["action"] == "teacher_info":
+        execution["facts"]["преподаватели"] = data.teachers or "Информация о преподавателях не указана."
+    elif route["action"] == "find_deadline":
+        execution = exec_deadlines(data.deadlines, "generic")
     elif route["action"] == "course_overview":
         execution = exec_course_overview(ontology)
-
-    elif route["action"] == "count_items":
-        execution = exec_count_items(course_modules, route["scope"])
-
-    elif route["action"] == "find_deadline":
-        execution = exec_deadlines(data.deadlines, route["scope"], user_msg)
-
-    elif route["action"] == "check_requirement":
-        execution = exec_requirement_check(data.page_context or "", user_msg)
-        debug_context.append({
-            "title": "restriction_count",
-            "text": str(execution["facts"].get("restriction_count", 0)),
-            "score": 0
-        })
-
-    elif route["action"] == "clarify":
-        previous_user = extract_last_user_message(data.history[:-1]) if len(data.history) > 1 else ""
-        merged_query = previous_user or route["query"] or user_msg
-        search_query = build_search_query(user_msg, data.history, merged_query)
-        execution = exec_answer_from_context(
-            db=db,
-            course_id=data.course_id,
-            viewer_role=viewer_role,
-            query=search_query,
-            scope="generic",
-            user_msg=user_msg
-        )
-        debug_context.append({"title": "search_query", "text": search_query, "score": 0})
-
-    elif route["action"] in {"answer_from_context", "smalltalk"}:
-        # smalltalk here still can use grounded facts from ontology without canned text
-        if route["action"] == "smalltalk":
-            execution = {
-                "facts": {
-                    "course_title": ontology.get("course_title", ""),
-                    "start_module": ontology.get("start_module"),
-                    "deadlines": data.deadlines[:3]
-                },
-                "targets": []
-            }
-        else:
-            search_query = build_search_query(user_msg, data.history, route["query"])
-            execution = exec_answer_from_context(
-                db=db,
-                course_id=data.course_id,
-                viewer_role=viewer_role,
-                query=search_query,
-                scope=route["scope"],
-                user_msg=user_msg
-            )
-            debug_context.append({"title": "search_query", "text": search_query, "score": 0})
+    elif route["action"] == "navigate":
+        execution = exec_navigation(course_modules, data.history)
     elif route["action"] == "global_faq":
-        search_query = build_search_query(user_msg, data.history, route["query"])
-        kb_rules = retrieve_knowledge_base(db, search_query)
-        execution = {
-            "facts": {
-                "университетские_правила": kb_rules,
-                "важная_инструкция": "Отвечай строго по предоставленным правилам кратко. Если правила выше не описывают ситуацию студента, ответь: 'В общих правилах нет точной информации об этом. Пожалуйста, обратитесь к преподавателю.'"
-            },
-            "targets": []
-        }
-        if kb_rules:
-            debug_context.append({"title": "Найдено в Базе Знаний", "text": "\n".join(kb_rules), "score": 0})
-
+        kb_rules = retrieve_knowledge_base(db, route["query"])
+        execution["facts"]["университетские_правила"] = kb_rules
+        if kb_rules: debug_context.append({"title": "База Знаний", "text": "\n".join(kb_rules), "score": 0})
     else:
-        search_query = build_search_query(user_msg, data.history, route["query"])
-        execution = exec_answer_from_context(
-            db=db,
-            course_id=data.course_id,
-            viewer_role=viewer_role,
-            query=search_query,
-            scope=route["scope"],
-            user_msg=user_msg
-        )
-        debug_context.append({"title": "search_query", "text": search_query, "score": 0})
+        execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"])
 
-    # Add candidate debug if present
+    if data.grades: execution["facts"]["оценки_студента"] = data.grades
+    if data.assign_status: execution["facts"]["статус_задания"] = data.assign_status
+    if data.teachers and route["action"] != "teacher_info": execution["facts"]["преподаватели_курса"] = data.teachers
+
     if execution.get("facts", {}).get("candidates"):
-        for idx, c in enumerate(execution["facts"]["candidates"][:5], start=1):
+        for idx, c in enumerate(execution["facts"]["candidates"][:3], start=1):
             score_val = execution.get("score_map", {}).get(c["id"], 0)
-            debug_context.append({
-                "title": f"{idx}. {c['title']}",
-                "text": c["content_text"][:180] + "...",
-                "score": score_val
-            })
+            debug_context.append(
+                {"title": f"{idx}. {c['title']}", "text": c["content_text"][:180] + "...", "score": score_val})
 
     response_data = generate_response(
         user_msg=user_msg,
         history=data.history,
         action=route["action"],
-        scope=route["scope"],
         execution=execution,
-        ontology=ontology,
-        teachers=data.teachers,
-        grades=data.grades,
-        assign_status=data.assign_status
+        ontology=ontology
     )
 
-    reply = response_data["reply"]
-    targets = [{
-        "id": t["moodle_id"],
-        "url": t["url"],
-        "title": t["title"],
-        "snippet": ""
-    } for t in response_data.get("targets", []) if t]
+    targets = [{"id": t["moodle_id"], "url": t["url"], "title": t["title"], "snippet": ""} for t in
+               response_data.get("targets", []) if t]
 
-    log_id = None
     try:
         new_log = ChatLog(
-            course_id=data.course_id,
-            viewer_role=viewer_role,
-            user_query=data.message,
-            ai_reply=reply,
-            used_context=(
-                f"action={route['action']}\n"
-                f"scope={route['scope']}\n"
-                f"router_query={route['query']}\n"
-                f"router_reason={route['reason']}\n"
-                f"targets={[t['title'] for t in response_data.get('targets', []) if t]}\n"
-            )
+            course_id=data.course_id, viewer_role=viewer_role, user_query=data.message, ai_reply=response_data["reply"],
+            used_context=f"action={route['action']}\nquery={route['query']}\n"
         )
         db.add(new_log)
         db.commit()
-        db.refresh(new_log)
-        log_id = new_log.id
     except Exception:
         pass
 
     return {
-        "reply": reply,
+        "reply": response_data["reply"],
         "targets": targets,
         "debug_context": debug_context,
-        "debug_meta": {
-            "action": route["action"],
-            "scope": route["scope"],
-            "router_query": route["query"],
-            "router_reason": route["reason"],
-            "chosen_title": targets[0]["title"] if targets else "",
-            "chosen_kind": response_data.get("targets", [{}])[0].get("kind", "") if response_data.get("targets") else "",
-            "last_nav_target": extract_last_bot_navigation_target(data.history)
-        },
-        "log_id": log_id
+        "debug_meta": {"action": route["action"], "router_query": route["query"]}
     }
 
 
@@ -1321,4 +755,5 @@ def save_feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
