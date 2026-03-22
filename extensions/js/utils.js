@@ -249,6 +249,51 @@ function getCourseMap() {
     return map.join('\n\n').substring(0, 3000);
 }
 
+async function getCourseParticipants() {
+    const courseId = getCourseId();
+    if (!courseId || courseId === "unknown") return []; // Теперь возвращаем массив
+
+    const cacheKey = `moodle_participants_array_${courseId}`;
+    if (sessionStorage.getItem(cacheKey)) return JSON.parse(sessionStorage.getItem(cacheKey));
+
+    try {
+        const response = await fetch(`/user/index.php?id=${courseId}&perpage=5000`, { credentials: 'include' });
+        const doc = new DOMParser().parseFromString(await response.text(), "text/html");
+
+        let participants = [];
+
+        doc.querySelectorAll('table#participants tbody tr').forEach(row => {
+            const nameNode = row.querySelector('.c1 a') || row.querySelector('.c1');
+            const roleNode = row.querySelector('.c2');
+            const groupNode = row.querySelector('.c3');
+
+            if (nameNode) {
+                let nameClone = nameNode.cloneNode(true);
+                nameClone.querySelectorAll('img, .accesshide').forEach(el => el.remove());
+
+                let name = cleanText(nameClone.innerText);
+
+                // ДОБАВЛЕНО: Если имя оказалось пустым после очистки, пропускаем эту строку!
+                if (!name || name.length < 2) return;
+
+                let role = roleNode ? cleanText(roleNode.innerText) : 'Студент';
+                let group = groupNode ? cleanText(groupNode.innerText) : '';
+
+                participants.push({
+                    name: name,
+                    role: role,
+                    group_name: group
+                });
+            }
+        });
+
+        sessionStorage.setItem(cacheKey, JSON.stringify(participants));
+        return participants;
+    } catch (e) {
+        return [];
+    }
+}
+
 async function getCourseTeachers() {
     const courseId = getCourseId();
     if (!courseId) return "Преподаватели неизвестны";
