@@ -200,45 +200,51 @@ function parseRuDate(dateStr) {
 
 function getCourseMap() {
     let map = [];
-    document.querySelectorAll('li.section.main').forEach(sec => {
-        let secTitleEl = sec.querySelector('h3.sectionname');
-        if (!secTitleEl) return;
-        let secTitle = secTitleEl.innerText.trim();
+    // Берем все скачанные страницы курса (главную + все скрытые темы)
+    const doms = window.MoodleBot.courseDOMsCache || [document];
 
-        let secDescEl = sec.querySelector('.summarytext');
-        let secDesc = secDescEl ? secDescEl.innerText.replace(/\n/g, ' ').trim() : "";
+    doms.forEach(doc => {
+        // Исключаем .section-summary, чтобы не дублировать блоки
+        doc.querySelectorAll('li.section.main:not(.section-summary)').forEach(sec => {
+            let secTitleEl = sec.querySelector('h3.sectionname');
+            if (!secTitleEl) return;
+            let secTitle = secTitleEl.innerText.trim();
 
-        let items = [];
-        sec.querySelectorAll('li.activity').forEach(act => {
-            let nameEl = act.querySelector('.instancename');
-            if (!nameEl) return;
+            let secDescEl = sec.querySelector('.summarytext');
+            let secDesc = secDescEl ? secDescEl.innerText.replace(/\n/g, ' ').trim() : "";
 
-            let moodleId = act.id;
-            let clone = nameEl.cloneNode(true);
-            clone.querySelectorAll('.accesshide').forEach(e => e.remove());
-            let itemName = clone.innerText.trim();
+            let items = [];
+            sec.querySelectorAll('li.activity').forEach(act => {
+                let nameEl = act.querySelector('.instancename');
+                if (!nameEl) return;
 
-            let tags = [];
-            if (act.classList.contains('hiddenactivity') || act.querySelector('.badge-warning')) {
-                tags.push('[СКРЫТО]');
+                let moodleId = act.id;
+                let clone = nameEl.cloneNode(true);
+                clone.querySelectorAll('.accesshide').forEach(e => e.remove());
+                let itemName = clone.innerText.trim();
+
+                let tags = [];
+                if (act.classList.contains('hiddenactivity') || act.querySelector('.badge-warning')) {
+                    tags.push('[СКРЫТО]');
+                }
+                let restriction = act.querySelector('.availabilityinfo .description-inner');
+                if (restriction) tags.push(`[УСЛОВИЕ ДОСТУПА: ${restriction.innerText.replace(/\n/g, ' ').trim()}]`);
+
+                let completion = act.querySelector('.automatic-completion-conditions');
+                if (completion) {
+                    let reqs = Array.from(completion.querySelectorAll('span.font-weight-normal')).map(e => e.innerText.trim());
+                    if (reqs.length > 0) tags.push(`[ДЛЯ ЗАВЕРШЕНИЯ НУЖНО: ${reqs.join(', ')}]`);
+                }
+
+                let tagStr = tags.length > 0 ? ` ${tags.join(' ')}` : '';
+                items.push(`ID: ${moodleId} | ${itemName}${tagStr}`);
+            });
+
+            if (items.length > 0) {
+                let descStr = secDesc ? `\n  Описание/Правила: ${secDesc}` : '';
+                map.push(`Раздел [${secTitle}]:${descStr}\n  ` + items.join('\n  '));
             }
-            let restriction = act.querySelector('.availabilityinfo .description-inner');
-            if (restriction) tags.push(`[УСЛОВИЕ ДОСТУПА: ${restriction.innerText.replace(/\n/g, ' ').trim()}]`);
-
-            let completion = act.querySelector('.automatic-completion-conditions');
-            if (completion) {
-                let reqs = Array.from(completion.querySelectorAll('span.font-weight-normal')).map(e => e.innerText.trim());
-                if (reqs.length > 0) tags.push(`[ДЛЯ ЗАВЕРШЕНИЯ НУЖНО: ${reqs.join(', ')}]`);
-            }
-
-            let tagStr = tags.length > 0 ? ` ${tags.join(' ')}` : '';
-            items.push(`ID: ${moodleId} | ${itemName}${tagStr}`);
         });
-
-        if (items.length > 0) {
-            let descStr = secDesc ? `\n  Описание/Правила: ${secDesc}` : '';
-            map.push(`Раздел [${secTitle}]:${descStr}\n  ` + items.join('\n  '));
-        }
     });
     return map.join('\n\n').substring(0, 3000);
 }

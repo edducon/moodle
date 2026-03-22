@@ -331,39 +331,39 @@ function getTeachersText() {
     }
 }
 
-function getCourseMapText() {
-    try {
-        const items = [];
-        document.querySelectorAll('li.activity').forEach((act) => {
-            if (typeof isActivityHidden === 'function' && isActivityHidden(act)) return;
-
-            const title = typeof extractModuleTitle === 'function'
-                ? extractModuleTitle(act)
-                : ((act.querySelector('.instancename, .activityname')?.innerText || '').trim());
-
-            if (!title) return;
-
-            let kind = 'other';
-            if (act.classList.contains('modtype_assign')) kind = 'lab';
-            else if (act.classList.contains('modtype_quiz')) kind = 'quiz';
-            else if (act.classList.contains('modtype_forum')) kind = 'forum';
-            else if (
-                act.classList.contains('modtype_page') ||
-                act.classList.contains('modtype_book') ||
-                act.classList.contains('modtype_file') ||
-                act.classList.contains('modtype_folder') ||
-                act.classList.contains('modtype_url') ||
-                act.classList.contains('modtype_lesson')
-            ) kind = 'lecture';
-
-            items.push(`${title} | type=${kind} | id=${act.id || ''}`);
-        });
-
-        return trimLongText(items.join('\n'), 12000);
-    } catch (e) {
-        return '';
-    }
-}
+// function getCourseMapText() {
+//     try {
+//         const items = [];
+//         document.querySelectorAll('li.activity').forEach((act) => {
+//             if (typeof isActivityHidden === 'function' && isActivityHidden(act)) return;
+//
+//             const title = typeof extractModuleTitle === 'function'
+//                 ? extractModuleTitle(act)
+//                 : ((act.querySelector('.instancename, .activityname')?.innerText || '').trim());
+//
+//             if (!title) return;
+//
+//             let kind = 'other';
+//             if (act.classList.contains('modtype_assign')) kind = 'lab';
+//             else if (act.classList.contains('modtype_quiz')) kind = 'quiz';
+//             else if (act.classList.contains('modtype_forum')) kind = 'forum';
+//             else if (
+//                 act.classList.contains('modtype_page') ||
+//                 act.classList.contains('modtype_book') ||
+//                 act.classList.contains('modtype_file') ||
+//                 act.classList.contains('modtype_folder') ||
+//                 act.classList.contains('modtype_url') ||
+//                 act.classList.contains('modtype_lesson')
+//             ) kind = 'lecture';
+//
+//             items.push(`${title} | type=${kind} | id=${act.id || ''}`);
+//         });
+//
+//         return trimLongText(items.join('\n'), 12000);
+//     } catch (e) {
+//         return '';
+//     }
+// }
 
 function getGradesText() {
     try {
@@ -672,7 +672,7 @@ function injectChatUI() {
                 viewer_role: getViewerRole(),
                 deadlines: window.MoodleBot.activeDeadlines || [],
                 course_title: getCourseTitleText(),
-                course_map: getCourseMapText(),
+                course_map: getCourseMap(),
                 teachers: getTeachersText(),
                 page_context: getPageContextHtml(),
                 grades: getGradesText(),
