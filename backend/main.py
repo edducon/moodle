@@ -11,13 +11,12 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 from config import settings
-from database import SessionLocal, Course, ModuleIndex, ChatLog, KnowledgeTopic, KnowledgeItem
+from database import SessionLocal, Course, ModuleIndex, ChatLog, CourseParticipant
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Moodle Assistant API")
@@ -104,10 +103,6 @@ class SemanticRouter:
             "course_overview": [
                 "из чего состоит курс", "что в курсе", "структура курса",
                 "сколько заданий", "сколько лекций", "о чем этот предмет"
-            ],
-            "global_faq": [
-                "что делать если заболел", "нужна ли справка", "пропустил занятие",
-                "правила университета", "пересдача"
             ]
         }
 
@@ -153,13 +148,24 @@ semantic_router = SemanticRouter(embedder)
 # =========================
 # SCHEMAS
 # =========================
+class ParticipantItem(BaseModel):
+    name: str
+    role: str
+    group_name: str = ""
 
 class CourseData(BaseModel):
     course_id: str
     title: str
     sections: List[Dict[str, Any]]
     viewer_role: Optional[str] = None
+    participants: List[ParticipantItem] = []
 
+class CourseData(BaseModel):
+    course_id: str
+    title: str
+    sections: List[Dict[str, Any]]
+    viewer_role: Optional[str] = None
+    participants: List[ParticipantItem] = []
 
 class ModuleUpdateData(BaseModel):
     course_id: str
@@ -259,44 +265,22 @@ def enrich_query_with_history(user_msg: str, history: List[ChatHistoryItem]) -> 
         return f"{clean_bot_msg[:80]} {msg}"
     return msg
 
-
-def sync_knowledge_base():
-    db = SessionLocal()
+def extract_json_from_text(text: str) -> dict:
     try:
-        file_path = "university_rules.json"
-        if not os.path.exists(file_path):
-            return
-
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        for topic_data in data:
-            topic = db.query(KnowledgeTopic).filter(KnowledgeTopic.title == topic_data["title"]).first()
-            if not topic:
-                topic = KnowledgeTopic(title=topic_data["title"], description=topic_data["description"])
-                db.add(topic)
-                db.commit()
-                db.refresh(topic)
-            else:
-                topic.description = topic_data["description"]
-                db.query(KnowledgeItem).filter(KnowledgeItem.topic_id == topic.id).delete()
-                db.commit()
-
-            items = topic_data.get("items", [])
-            if items:
-                embeddings = embedder.encode(items).tolist()
-                for text_item, vector in zip(items, embeddings):
-                    db.add(KnowledgeItem(topic_id=topic.id, content=text_item, embedding=vector))
-            db.commit()
-    except Exception as e:
-        print(f"Ошибка KB: {e}")
-    finally:
-        db.close()
-
-
-@app.on_event("startup")
-def startup_event():
-    sync_knowledge_base()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            raw = text[start:end + 1]
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                raw = re.sub(r",\s*}", "}", raw)
+                raw = re.sub(r",\s*\]", "]", raw)
+                raw = raw.replace("\n", " ").replace("\r", "")
+                return json.loads(raw)
+    except Exception:
+        pass
+    return {}
 
 
 def db_module_visible_for_role(mod: ModuleIndex, viewer_role: Optional[str]) -> bool:
@@ -638,10 +622,35 @@ def sync_course(data: CourseData, db: Session = Depends(get_db)):
     else:
         db_course = Course(course_id=data.course_id, title=data.title, content=data.sections)
         db.add(db_course)
+        db.commit()  # Сохраняем курс, чтобы привязать к нему участников
         is_new = True
+
+    # Обновляем участников с защитой от перезаписи студентами
+    if data.participants:
+        current_count = db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).count()
+
+        # Разрешаем запись, если это препод ИЛИ если база пока пустая
+        if data.viewer_role == "teacher" or current_count == 0:
+            db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).delete()
+
+            new_participants = []
+            for p in data.participants:
+                # Защита от пустых имен
+                if not p.name.strip():
+                    continue
+
+                new_participants.append(CourseParticipant(
+                    course_id=data.course_id,
+                    name=p.name,
+                    role=p.role,
+                    group_name=p.group_name
+                ))
+            db.bulk_save_objects(new_participants)
     db.commit()
     indexed_count = db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count()
-    return {"status": "success", "needs_initial_sync": is_new or (indexed_count == 0)}
+    needs_sync = is_new or (indexed_count == 0)
+
+    return {"status": "success", "needs_initial_sync": needs_sync}
 
 
 @app.post("/api/module/update")
@@ -712,7 +721,25 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         return {"reply": "Курс еще не проиндексирован.", "targets": []}
 
     db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
-    if not db_course: return {"reply": "Курс не найден.", "targets": []}
+    if not db_course:
+        return {"reply": "Курс не найден.", "targets": []}
+
+    db_participants = db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).all()
+
+    teachers = []
+    students = []
+    for p in db_participants:
+        info = f"- {p.name} (Группа: {p.group_name})" if p.group_name else f"- {p.name}"
+        if "преподаватель" in p.role.lower() or "ассистент" in p.role.lower() or "создатель" in p.role.lower():
+            teachers.append(info)
+        else:
+            students.append(info)
+
+    participants_str = ""
+    if teachers:
+        participants_str += "ПРЕПОДАВАТЕЛИ:\n" + "\n".join(teachers) + "\n\n"
+    if students:
+        participants_str += "СТУДЕНТЫ:\n" + "\n".join(students)
 
     user_msg = safe_strip(data.message)
     viewer_role = data.viewer_role or "student"
@@ -731,23 +758,22 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     execution: Dict[str, Any] = {"facts": {}, "targets": []}
 
     if route["action"] == "teacher_info":
-        execution["facts"]["преподаватели"] = data.teachers or "Информация о преподавателях не указана."
+        execution["facts"]["участники_курса"] = participants_str or "Информация об участниках не найдена."
     elif route["action"] == "find_deadline":
         execution = exec_deadlines(data.deadlines, "generic")
     elif route["action"] == "course_overview":
         execution = exec_course_overview(ontology)
     elif route["action"] == "navigate":
         execution = exec_navigation(course_modules, data.history)
-    elif route["action"] == "global_faq":
-        kb_rules = retrieve_knowledge_base(db, route["query"])
-        execution["facts"]["университетские_правила"] = kb_rules
-        if kb_rules: debug_context.append({"title": "База Знаний", "text": "\n".join(kb_rules), "score": 0})
     else:
         execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"])
 
-    if data.grades: execution["facts"]["оценки_студента"] = data.grades
-    if data.assign_status: execution["facts"]["статус_задания"] = data.assign_status
-    if data.teachers and route["action"] != "teacher_info": execution["facts"]["преподаватели_курса"] = data.teachers
+    if data.grades:
+        execution["facts"]["оценки_студента"] = data.grades
+    if data.assign_status:
+        execution["facts"]["статус_задания"] = data.assign_status
+    if participants_str and route["action"] != "teacher_info":
+        execution["facts"]["участники_курса"] = participants_str
 
     if execution.get("facts", {}).get("candidates"):
         for idx, c in enumerate(execution["facts"]["candidates"][:3], start=1):

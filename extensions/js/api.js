@@ -37,6 +37,9 @@ async function parseCourseIndex() {
         });
     });
 
+    // 1. ДОБАВЛЕНО: Собираем участников перед отправкой на сервер
+    const participantsData = await getCourseParticipants();
+
     try {
         const res = await fetch("http://127.0.0.1:8000/api/course/sync", {
             method: "POST",
@@ -45,7 +48,8 @@ async function parseCourseIndex() {
                 course_id: courseId,
                 title: document.title,
                 sections: Array.from(sectionsMap.values()),
-                viewer_role: getViewerRole()
+                viewer_role: getViewerRole(),
+                participants: participantsData // 2. ДОБАВЛЕНО: Передаем их в Python
             })
         });
 
