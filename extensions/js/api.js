@@ -92,6 +92,7 @@ async function runSilentSpider() {
                 let metaContext = [];
                 const vis = item.visibility || {};
 
+                if (vis.section_title) metaContext.push("Тема/Раздел курса: " + vis.section_title);
                 if (vis.dates && vis.dates.length > 0) metaContext.push("Даты/Сроки: " + vis.dates.join("; "));
                 if (vis.restrictions && vis.restrictions.length > 0) metaContext.push("Ограничения доступа: " + vis.restrictions.join("; "));
                 if (vis.completion_rules && vis.completion_rules.length > 0) metaContext.push("Условия завершения элемента: " + vis.completion_rules.join("; "));
@@ -170,6 +171,7 @@ async function passiveModuleSync() {
             // Если зашли на страницу, подгружаем мету с главной страницы курса, если есть
             if (visInfo) {
                 let metaContext = [];
+                if (visInfo.section_title) metaContext.push("Тема/Раздел курса: " + visInfo.section_title);
                 if (visInfo.dates && visInfo.dates.length > 0) metaContext.push("Даты/Сроки: " + visInfo.dates.join("; "));
                 if (visInfo.restrictions && visInfo.restrictions.length > 0) metaContext.push("Ограничения доступа: " + visInfo.restrictions.join("; "));
                 if (visInfo.completion_rules && visInfo.completion_rules.length > 0) metaContext.push("Условия завершения элемента: " + visInfo.completion_rules.join("; "));

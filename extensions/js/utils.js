@@ -5,10 +5,21 @@ async function getCourseDOMs() {
     if (window.MoodleBot.courseDOMsCache) return window.MoodleBot.courseDOMsCache;
 
     const doms = [document];
-    const sectionLinks = Array.from(document.querySelectorAll('h3.sectionname a[href*="section="]')).map(a => a.href);
+
+    // НОВОЕ: Ищем ссылки на скрытые секции во ВСЕХ форматах (недели, темы, сетка)
+    const linkNodes = document.querySelectorAll(
+        'h3.sectionname a[href*="section="], ' +          /* Обычный формат с пагинацией */
+        '.thegrid a.grid-section-inner[href*="section="], ' + /* Формат "Сетка" (Grid) */
+        '.course-content .section-summary a[href*="section="]' /* Свернутые темы */
+    );
+
+    // Собираем уникальные ссылки, чтобы не качать одну страницу дважды
+    let links = new Set();
+    linkNodes.forEach(a => links.add(a.href));
+    const sectionLinks = Array.from(links);
 
     if (sectionLinks.length > 0) {
-        console.log(`[Moodle Bot] Найдена пагинация. Загружаю ${sectionLinks.length} скрытых разделов...`);
+        console.log(`[Moodle Bot] Найдена пагинация/сетка. Загружаю ${sectionLinks.length} скрытых разделов...`);
         for (let i = 0; i < sectionLinks.length; i += 3) {
             const chunk = sectionLinks.slice(i, i + 3);
             const promises = chunk.map(async (url) => {
@@ -20,7 +31,7 @@ async function getCourseDOMs() {
             });
             const results = await Promise.all(promises);
             doms.push(...results.filter(Boolean));
-            await new Promise(r => setTimeout(r, 200));
+            await new Promise(r => setTimeout(r, 200)); // небольшая пауза, чтобы не дудосить сервер
         }
     }
 
@@ -71,6 +82,7 @@ function extractVisibilityInfo(actElement) {
     let meta = {
         is_hidden: isActivityHidden(actElement),
         has_restrictions: hasRestrictionMarkers(actElement) && !isActivityHidden(actElement),
+        section_title: "", // НОВОЕ: Название темы/раздела
         restrictions: [],
         dates: [],
         completion_rules: [],
@@ -80,12 +92,31 @@ function extractVisibilityInfo(actElement) {
     };
 
     try {
-        // 1. Даты (Открыто с, Срок сдачи, Представление работ)
-        const datesEls = actElement.querySelectorAll('.activity-dates div');
-        datesEls.forEach(el => {
-            const txt = cleanText(el.innerText);
-            if (txt) meta.dates.push(txt);
-        });
+        // 0. Находим, в какой теме (разделе) находится элемент
+        const sectionNode = actElement.closest('li.section.main');
+        if (sectionNode) {
+            const secTitleNode = sectionNode.querySelector('h3.sectionname');
+            if (secTitleNode) {
+                meta.section_title = cleanText(secTitleNode.innerText);
+            }
+        }
+
+        // 1. Даты (ИСПРАВЛЕНО ДУБЛИРОВАНИЕ)
+        const datesWrapper = actElement.querySelector('.activity-dates .description-inner');
+        if (datesWrapper) {
+            // Берем только прямых детей, чтобы не хватать текст родителя
+            Array.from(datesWrapper.children).forEach(child => {
+                const txt = cleanText(child.innerText);
+                if (txt) meta.dates.push(txt);
+            });
+        } else {
+            // Фолбэк на случай другой верстки Moodle
+            const altDates = actElement.querySelector('.activity-dates');
+            if (altDates) {
+                const txt = cleanText(altDates.innerText);
+                if (txt) meta.dates.push(txt);
+            }
+        }
 
         // 2. Условия доступа и ограничения
         const restrictTree = actElement.querySelectorAll('.availabilityinfo li:not(.showmore)');
@@ -340,7 +371,14 @@ function extractMeaningfulContent(doc) {
 }
 
 function shouldIndexModuleType(type) {
-    return ['page', 'resource', 'assign', 'book', 'quiz', 'url', 'label', 'lesson', 'folder', 'forum', 'chat', 'checklist'].includes(type);
+    // Если тип пустой, игнорируем
+    if (!type) return false;
+
+    // Если нужно игнорировать какие-то конкретные системные модули,
+    // можно добавить их сюда. Но по умолчанию теперь разрешаем ВСЕ типы.
+    const ignoredTypes = ['scorm', 'feedback'];
+
+    return !ignoredTypes.includes(type);
 }
 
 function isFileActivity(act) {
