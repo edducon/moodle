@@ -93,7 +93,9 @@ class SemanticRouter:
             "grading": [
                 "как получить оценку", "система оценивания", "критерии оценки",
                 "как сдать экзамен", "как получить зачет", "баллы за задания",
-                "как получить 5", "как получить автомат", "что будет на экзамене"
+                "как получить 5", "как получить автомат", "что будет на экзамене",
+                "как получить пятерку", "как получить пятерочку", "получить хорошую оценку",
+                "что нужно для отличника", "минимум для зачета"
             ],
             "find_deadline": [
                 "когда сдавать", "дедлайн", "срок сдачи", "до какого числа",
@@ -222,6 +224,16 @@ ANAPHORA_MARKERS = [
     "а как", "как это", "а она", "а оно", "он", "она", "они", "туда"
 ]
 
+SELF_CONTAINED_MARKERS = [
+    "что такое", "как работает", "почему", "зачем", "когда", "где находится",
+    "нужно ли", "обязательно ли", "можно ли", "стоит ли"
+]
+
+ERROR_MARKERS = [
+    "техническая ошибка", "пожалуйста, попробуйте", "произошла ошибка",
+    "не проиндексирован", "не найден", "попробуйте спросить"
+]
+
 
 def enrich_query_with_history(user_msg: str, history: List[ChatHistoryItem]) -> str:
     msg = safe_strip(user_msg)
@@ -229,13 +241,19 @@ def enrich_query_with_history(user_msg: str, history: List[ChatHistoryItem]) -> 
 
     padded_msg = f" {msg_lower} "
     has_anaphora = any(f" {marker} " in padded_msg for marker in ANAPHORA_MARKERS)
+    is_self_contained = any(marker in msg_lower for marker in SELF_CONTAINED_MARKERS)
 
-    is_short = len(msg.split()) <= 4
-
-    if not (is_short or has_anaphora):
+    if not has_anaphora or is_self_contained:
         return msg
 
-    last_bot_msg = next((h.content for h in reversed(history) if h.role == "assistant"), "")
+    last_bot_msg = next(
+        (h.content for h in reversed(history)
+         if h.role == "assistant"
+         and not any(err in h.content.lower() for err in ERROR_MARKERS)
+         and len(h.content) > 20),
+        ""
+    )
+
     if last_bot_msg:
         clean_bot_msg = re.sub(r'<[^>]+>', '', last_bot_msg)
         return f"{clean_bot_msg[:80]} {msg}"
@@ -295,17 +313,18 @@ def course_module_visible_for_role(module_data: Dict[str, Any], viewer_role: Opt
     return True
 
 
-def split_text_into_chunks(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+def split_text_into_chunks(text: str, chunk_size: int = 450, overlap: int = 150) -> List[str]:
     if not text: return []
     text = re.sub(r"Печатать книгу.*?Оглавление", "", text, flags=re.IGNORECASE | re.DOTALL)
-    paragraphs = re.split(r"\n+", text.strip())
 
+    paragraphs = re.split(r"\n+", text.strip())
     chunks = []
     current_chunk = ""
 
     for p in paragraphs:
         p = p.strip()
-        if not p or len(p) < 10: continue
+        if not p or len(p) < 10:
+            continue
 
         if len(current_chunk) + len(p) + 1 <= chunk_size:
             current_chunk += ("\n" + p if current_chunk else p)
@@ -313,14 +332,38 @@ def split_text_into_chunks(text: str, chunk_size: int = 1000, overlap: int = 200
             if current_chunk:
                 chunks.append(current_chunk.strip())
                 overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-                match = re.search(r'[.!?]\s+([A-ZА-ЯЁ])', overlap_text)
-                if match: overlap_text = overlap_text[match.end(1) - 1:]
-                current_chunk = overlap_text + "\n" + p
+                space_idx = overlap_text.find(' ')
+                if space_idx != -1:
+                    overlap_text = overlap_text[space_idx + 1:]
+                current_chunk = overlap_text + "\n"
             else:
-                current_chunk = p
+                current_chunk = ""
 
-    if current_chunk:
+            while len(p) > chunk_size:
+                cut_idx = p.rfind(' ', 0, chunk_size)
+                if cut_idx == -1:
+                    cut_idx = chunk_size
+
+                part = current_chunk + p[:cut_idx]
+                chunks.append(part.strip())
+                current_chunk = ""
+
+                overlap_start = max(0, cut_idx - overlap)
+                space_overlap = p.find(' ', overlap_start)
+
+                if space_overlap != -1 and space_overlap < cut_idx:
+                    p = p[space_overlap + 1:]
+                else:
+                    p = p[overlap_start:]
+
+            if len(p.strip()) >= 10:
+                current_chunk += p
+            else:
+                current_chunk = ""
+
+    if len(current_chunk.strip()) >= 10:
         chunks.append(current_chunk.strip())
+
     return chunks
 
 
