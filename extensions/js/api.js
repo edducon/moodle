@@ -16,11 +16,16 @@ async function parseCourseIndex() {
 
                 sec.querySelectorAll('li.activity').forEach(act => {
                     const a = act.querySelector('a.aalink');
+                    const moduleType = getModuleType(act);
+
+                    // Собираем даже те элементы, у которых нет ссылок (например, метки/label)
+                    const urlToSave = a ? a.href : window.location.origin + window.location.pathname + '#' + act.id;
+
                     sectionData.modules.push({
                         moodle_id: act.id,
-                        type: getModuleType(act),
-                        title: extractModuleTitle(act),
-                        url: a ? a.href : null,
+                        type: moduleType,
+                        title: moduleType === 'label' ? 'Текстовый блок' : extractModuleTitle(act),
+                        url: urlToSave,
                         visibility: extractVisibilityInfo(act)
                     });
                 });
@@ -59,16 +64,17 @@ async function runSilentSpider() {
         doc.querySelectorAll('li.activity').forEach(act => {
             const a = act.querySelector('a.aalink');
             const moduleType = getModuleType(act);
+            const isLabel = moduleType === 'label';
 
-            if (a && shouldIndexModuleType(moduleType) && !validModulesMap.has(act.id)) {
-                const descEl = act.querySelector('.description .no-overflow, .contentafterlink .no-overflow');
+            // Разрешаем меткам (label) попадать в паук без ссылки
+            if ((a || isLabel) && shouldIndexModuleType(moduleType) && !validModulesMap.has(act.id)) {
+                const visibilityData = extractVisibilityInfo(act);
                 validModulesMap.set(act.id, {
-                    href: a.href,
+                    href: a ? a.href : window.location.origin + window.location.pathname + '#' + act.id,
                     moodle_id: act.id,
                     module_type: moduleType,
-                    title: extractModuleTitle(act),
-                    visibility: extractVisibilityInfo(act),
-                    inline_desc: descEl ? cleanText(descEl.innerText) : "",
+                    title: isLabel ? 'Текстовый блок (пояснение)' : extractModuleTitle(act),
+                    visibility: visibilityData,
                     is_file: isFileActivity(act)
                 });
             }
@@ -82,9 +88,28 @@ async function runSilentSpider() {
 
         const promises = chunk.map(async (item) => {
             try {
+                // Создаем красивый текстовый блок с метаданными для ИИ
+                let metaContext = [];
+                const vis = item.visibility || {};
+
+                if (vis.dates && vis.dates.length > 0) metaContext.push("Даты/Сроки: " + vis.dates.join("; "));
+                if (vis.restrictions && vis.restrictions.length > 0) metaContext.push("Ограничения доступа: " + vis.restrictions.join("; "));
+                if (vis.completion_rules && vis.completion_rules.length > 0) metaContext.push("Условия завершения элемента: " + vis.completion_rules.join("; "));
+                if (vis.resource_details) metaContext.push("Параметры файла: " + vis.resource_details);
+                if (vis.inline_desc) metaContext.push("Описание на странице: " + vis.inline_desc);
+
+                const metaString = metaContext.length > 0 ? ("\nМЕТАДАННЫЕ ЭЛЕМЕНТА:\n" + metaContext.join("\n")) : "";
+
+                // Если это файл
                 if (item.is_file) {
-                    const fileSeoText = `Это прикрепленный учебный материал (файл) по теме "${item.title}". Обязательно изучите этот файл. ${item.inline_desc || ''}`;
+                    const fileSeoText = `Это прикрепленный учебный материал (файл) по теме "${item.title}". Обязательно изучите этот файл.` + metaString;
                     return { ...item, content_text: cleanText(fileSeoText), url: item.href };
+                }
+
+                // Если это текстовая метка на главной странице курса
+                if (item.module_type === 'label') {
+                    const labelText = `Это текстовая вставка (пояснение) на странице курса.` + metaString;
+                    return { ...item, content_text: cleanText(labelText), url: item.href };
                 }
 
                 let fetchUrl = item.href;
@@ -96,25 +121,24 @@ async function runSilentSpider() {
                 const contentType = response.headers.get('content-type');
 
                 if (contentType && !contentType.includes('text/html')) {
-                    const fileSeoText = `Это загружаемый файл по теме "${item.title}". ${item.inline_desc || ''}`;
+                    const fileSeoText = `Это загружаемый файл по теме "${item.title}".` + metaString;
                     return { ...item, content_text: cleanText(fileSeoText), url: item.href };
                 }
 
                 const doc = new DOMParser().parseFromString(await response.text(), "text/html");
                 let text = extractMeaningfulContent(doc);
 
-                if (item.inline_desc) {
-                    text = item.inline_desc + "\n" + text;
-                }
-
                 if (!text || text.length < 80) {
                     const hasVideo = doc.querySelector('iframe, video, .mediaplugin');
                     text = cleanText(hasVideo || item.title.toLowerCase().includes('видео')
-                        ? `Это обучающая видеолекция по теме "${item.title}". ${item.inline_desc || ''}`
-                        : `Это практический материал по теме "${item.title}". ${item.inline_desc || ''}`);
+                        ? `Это обучающая видеолекция по теме "${item.title}".`
+                        : `Это практический материал по теме "${item.title}".`);
                 }
 
-                return { ...item, content_text: text, url: item.href };
+                // Прикрепляем к спарсенному тексту всю извлеченную мету
+                text = text + "\n\n" + metaString;
+
+                return { ...item, content_text: text.trim(), url: item.href };
             } catch (err) { return null; }
         });
 
@@ -140,6 +164,23 @@ async function passiveModuleSync() {
 
     if (id && mainContent) {
         try {
+            let text = extractMeaningfulContent(document);
+            const visInfo = act ? extractVisibilityInfo(act) : null;
+
+            // Если зашли на страницу, подгружаем мету с главной страницы курса, если есть
+            if (visInfo) {
+                let metaContext = [];
+                if (visInfo.dates && visInfo.dates.length > 0) metaContext.push("Даты/Сроки: " + visInfo.dates.join("; "));
+                if (visInfo.restrictions && visInfo.restrictions.length > 0) metaContext.push("Ограничения доступа: " + visInfo.restrictions.join("; "));
+                if (visInfo.completion_rules && visInfo.completion_rules.length > 0) metaContext.push("Условия завершения элемента: " + visInfo.completion_rules.join("; "));
+                if (visInfo.resource_details) metaContext.push("Параметры файла: " + visInfo.resource_details);
+                if (visInfo.inline_desc) metaContext.push("Описание на странице: " + visInfo.inline_desc);
+
+                if (metaContext.length > 0) {
+                    text += "\n\nМЕТАДАННЫЕ ЭЛЕМЕНТА:\n" + metaContext.join("\n");
+                }
+            }
+
             await fetch("http://127.0.0.1:8000/api/module/update", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -147,9 +188,9 @@ async function passiveModuleSync() {
                     course_id: getCourseId(),
                     moodle_id: `module-${id}`,
                     module_type: act ? getModuleType(act) : null,
-                    content_text: extractMeaningfulContent(document),
+                    content_text: text.trim(),
                     url: window.location.href,
-                    visibility: act ? extractVisibilityInfo(act) : { is_hidden: false, has_restrictions: false, raw_text: "" }
+                    visibility: visInfo || { is_hidden: false, has_restrictions: false, raw_text: "" }
                 })
             });
         } catch (e) {}
