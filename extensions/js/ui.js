@@ -599,7 +599,7 @@ function injectChatUI() {
         }
     });
 
-    messagesArea.innerHTML = sessionStorage.getItem(historyKey) || `<div class="bot-msg">Привет! Я помощник по этому курсу. Напишите тему, и я подскажу, где это находится.</div>`;
+    messagesArea.innerHTML = sessionStorage.getItem(historyKey) || '';
 
     const addMessageToChat = function(htmlString) {
         messagesArea.innerHTML += htmlString;
@@ -843,9 +843,11 @@ setTimeout(async () => {
                 if (!localStorage.getItem(onboardingKey)) {
                     let quizCount = 0; let assignCount = 0;
                     const doms = await getCourseDOMs();
+                    // Считаем только реально доступные элементы (не скрытые И не ограниченные)
+                    const isAvailable = (el) => !isActivityHidden(el) && !hasRestrictionMarkers(el);
                     doms.forEach(doc => {
-                        quizCount += Array.from(doc.querySelectorAll('li.activity.modtype_quiz')).filter(el => !isActivityHidden(el)).length;
-                        assignCount += Array.from(doc.querySelectorAll('li.activity.modtype_assign')).filter(el => !isActivityHidden(el)).length;
+                        quizCount += Array.from(doc.querySelectorAll('li.activity.modtype_quiz')).filter(isAvailable).length;
+                        assignCount += Array.from(doc.querySelectorAll('li.activity.modtype_assign')).filter(isAvailable).length;
                     });
 
                     let welcomeMsg = `Привет! 👋 Я твой ИИ-помощник по этому курсу. Давай посмотрим, что нас ждет впереди:<br><br>📝 <b>Практических заданий:</b> ${assignCount}<br>🧠 <b>Тестов:</b> ${quizCount}<br><br>`;
@@ -967,6 +969,23 @@ setTimeout(async () => {
             const teacherKey = `moodle_bot_teacher_notified_${courseId}`;
             const today = new Date().toLocaleDateString('ru-RU');
 
+            // Тихо парсим дедлайны для преподавателя тоже (для чата, без виджета)
+            const deadlinesCacheKey = `moodle_bot_teacher_deadlines_cache_${courseId}`;
+            const deadlinesCacheTimeKey = `moodle_bot_teacher_deadlines_time_${courseId}`;
+            const now = new Date().getTime();
+            const cachedDeadlines = sessionStorage.getItem(deadlinesCacheKey);
+            const cachedDTime = sessionStorage.getItem(deadlinesCacheTimeKey);
+
+            if (cachedDeadlines && cachedDTime && (now - parseInt(cachedDTime) < 1800000)) {
+                window.MoodleBot.activeDeadlines = JSON.parse(cachedDeadlines);
+            } else {
+                extractDeadlinesFromCourse().then(deadlines => {
+                    window.MoodleBot.activeDeadlines = deadlines;
+                    sessionStorage.setItem(deadlinesCacheKey, JSON.stringify(deadlines));
+                    sessionStorage.setItem(deadlinesCacheTimeKey, now.toString());
+                });
+            }
+
             const processTeacherData = (ungradedList) => {
                 renderUngradedWidget(ungradedList);
 
@@ -1006,6 +1025,10 @@ setTimeout(async () => {
             };
 
             fetchTeacherData();
+
+            // Проверяем логи курса на наличие обновлений (доступно только преподавателям)
+            // Если препод что-то изменил — автоматически перезапускаем индексацию
+            checkMoodleLogForUpdates();
 
             document.addEventListener('click', (e) => {
                 const btn = e.target.closest('.md-refresh-btn');

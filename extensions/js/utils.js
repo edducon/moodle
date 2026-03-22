@@ -249,81 +249,56 @@ function getCourseMap() {
     return map.join('\n\n').substring(0, 3000);
 }
 
-async function getCourseParticipants() {
+// Парсинг страницы участников — ищем только преподавателей
+// Возвращает массив объектов {name, role, group_name} или пустой массив
+async function parseTeachersFromParticipants() {
     const courseId = getCourseId();
-    if (!courseId || courseId === "unknown") return []; // Теперь возвращаем массив
+    if (!courseId) return [];
 
-    const cacheKey = `moodle_participants_array_${courseId}`;
-    if (sessionStorage.getItem(cacheKey)) return JSON.parse(sessionStorage.getItem(cacheKey));
-
-    try {
-        const response = await fetch(`/user/index.php?id=${courseId}&perpage=5000`, { credentials: 'include' });
-        const doc = new DOMParser().parseFromString(await response.text(), "text/html");
-
-        let participants = [];
-
-        doc.querySelectorAll('table#participants tbody tr').forEach(row => {
-            const nameNode = row.querySelector('.c1 a') || row.querySelector('.c1');
-            const roleNode = row.querySelector('.c2');
-            const groupNode = row.querySelector('.c3');
-
-            if (nameNode) {
-                let nameClone = nameNode.cloneNode(true);
-                nameClone.querySelectorAll('img, .accesshide').forEach(el => el.remove());
-
-                let name = cleanText(nameClone.innerText);
-
-                // ДОБАВЛЕНО: Если имя оказалось пустым после очистки, пропускаем эту строку!
-                if (!name || name.length < 2) return;
-
-                let role = roleNode ? cleanText(roleNode.innerText) : 'Студент';
-                let group = groupNode ? cleanText(groupNode.innerText) : '';
-
-                participants.push({
-                    name: name,
-                    role: role,
-                    group_name: group
-                });
-            }
-        });
-
-        sessionStorage.setItem(cacheKey, JSON.stringify(participants));
-        return participants;
-    } catch (e) {
-        return [];
+    const cacheKey = `moodle_teachers_parsed_${courseId}`;
+    const cached = sessionStorage.getItem(cacheKey);
+    if (cached) {
+        try { return JSON.parse(cached); } catch(e) {}
     }
-}
-
-async function getCourseTeachers() {
-    const courseId = getCourseId();
-    if (!courseId) return "Преподаватели неизвестны";
-
-    const cacheKey = `moodle_teachers_${courseId}`;
-    if (sessionStorage.getItem(cacheKey)) return sessionStorage.getItem(cacheKey);
 
     try {
-        const response = await fetch(`https://online.mospolytech.ru/user/index.php?id=${courseId}&perpage=5000`);
+        // Определяем базовый URL текущего сайта
+        const baseUrl = window.location.origin;
+        const response = await fetch(`${baseUrl}/user/index.php?id=${courseId}&perpage=5000`, { credentials: 'include' });
         const html = await response.text();
         const doc = new DOMParser().parseFromString(html, "text/html");
 
         let teachers = [];
-        doc.querySelectorAll('table#participants tbody tr').forEach(row => {
-            const roleCell = row.querySelector('td.c7');
-            if (roleCell && roleCell.innerText.includes('Преподаватель')) {
+        doc.querySelectorAll('table#participants tbody tr:not(.emptyrow)').forEach(row => {
+            // Ищем роль по атрибуту data-itemtype="user_roles" — работает на любом Moodle
+            const roleSpan = row.querySelector('[data-itemtype="user_roles"]');
+            if (!roleSpan) return;
+
+            const roleText = (roleSpan.innerText || '').trim();
+            // Ловим все вариации: "Преподаватель", "Ассистент", "Тьютор группы"
+            if (/преподаватель|ассистент|тьютор/i.test(roleText)) {
                 const nameCell = row.querySelector('th.c1');
-                const emailCell = row.querySelector('td.c3');
+                // Группы тоже ищем по атрибуту вместо хардкода столбца
+                const groupSpan = row.querySelector('[data-itemtype="user_groups"]');
                 if (nameCell) {
-                    let name = nameCell.innerText.trim();
-                    let email = emailCell ? emailCell.innerText.trim() : '';
-                    teachers.push(`${name} (${email})`);
+                    // Убираем аватар — берём только текст
+                    const clone = nameCell.cloneNode(true);
+                    clone.querySelectorAll('img').forEach(el => el.remove());
+                    const name = (clone.innerText || '').trim();
+                    const groupName = groupSpan ? (groupSpan.innerText || '').trim() : '';
+
+                    if (name) {
+                        teachers.push({ name, role: roleText, group_name: groupName });
+                    }
                 }
             }
         });
-        const result = teachers.length > 0 ? "Преподаватели: " + teachers.join(', ') : "Преподаватели не найдены";
-        sessionStorage.setItem(cacheKey, result);
-        return result;
+
+        sessionStorage.setItem(cacheKey, JSON.stringify(teachers));
+        return teachers;
     } catch (e) {
-        return "Не удалось загрузить список преподавателей";
+        console.warn('[Moodle Bot] Не удалось спарсить преподавателей со страницы участников:', e);
+        return [];
     }
 }
 
@@ -412,10 +387,25 @@ function extractMeaningfulContent(doc) {
     if (!mainNode) return '';
 
     const clone = mainNode.cloneNode(true);
-    const selectorsToRemove = ['#nav-drawer', '[data-region="drawer"]', '[data-region="message-drawer"]', '.popover-region', '#page-footer', 'footer', 'nav', '.navbar', '.block', '.activity-navigation', '.sr-only', '.hidden', 'script', 'style'];
+    const selectorsToRemove = [
+        '#nav-drawer', '[data-region="drawer"]', '[data-region="message-drawer"]', '.popover-region',
+        '#page-footer', 'footer', 'nav', '.navbar', '.block', '.activity-navigation',
+        '.sr-only', '.hidden', 'script', 'style',
+        // --- Убираем интерфейс оценивания (виден только преподавателю) ---
+        '.gradingsummary', '.submissionsummarytable', '[data-region="grading-summary"]',
+        'select', '.groupselector'
+    ];
 
     selectorsToRemove.forEach(selector => {
         clone.querySelectorAll(selector).forEach(el => el.remove());
+    });
+
+    // --- Убираем таблицы со статистикой ответов преподавателя ---
+    clone.querySelectorAll('table').forEach(table => {
+        const text = table.innerText || '';
+        if (text.includes('Требуют оценки') || text.includes('Просмотр всех ответов')) {
+            table.remove();
+        }
     });
 
     return cleanText(clone.innerText || clone.textContent || '');

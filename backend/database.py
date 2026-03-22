@@ -4,6 +4,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, relationship
 from datetime import datetime, timezone
 
+
 from pgvector.sqlalchemy import Vector
 from config import settings
 
@@ -20,22 +21,6 @@ class Course(Base):
     title = Column(String)
     content = Column(JSONB)
     last_updated = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-
-    # Добавляем связь для быстрого доступа
-    participants = relationship("CourseParticipant", back_populates="course", cascade="all, delete-orphan")
-
-
-# НОВАЯ ТАБЛИЦА
-class CourseParticipant(Base):
-    __tablename__ = "course_participants"
-
-    id = Column(Integer, primary_key=True, index=True)
-    course_id = Column(String, ForeignKey("courses.course_id", ondelete="CASCADE"), index=True)
-    name = Column(String, index=True)
-    role = Column(String, index=True)
-    group_name = Column(String, nullable=True)
-
-    course = relationship("Course", back_populates="participants")
 
 class ModuleIndex(Base):
     __tablename__ = "module_index"
@@ -62,6 +47,15 @@ class ChatLog(Base):
     used_context = Column(Text) # Сохраняем, на какие куски текста ИИ опирался
     is_helpful = Column(Boolean, nullable=True)
 
+class CourseParticipant(Base):
+    __tablename__ = "course_participants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    course_id = Column(String, index=True)
+    name = Column(String)
+    role = Column(String)
+    group_name = Column(String, nullable=True)
+
 with engine.connect() as conn:
     conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     conn.commit()
@@ -76,5 +70,18 @@ with engine.connect() as conn:
     conn.execute(text("""
         ALTER TABLE module_index
         ADD COLUMN IF NOT EXISTS visibility JSONB
+    """))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS course_participants (
+            id SERIAL PRIMARY KEY,
+            course_id VARCHAR,
+            name VARCHAR,
+            role VARCHAR,
+            group_name VARCHAR
+        )
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_course_participants_course_id
+        ON course_participants (course_id)
     """))
     conn.commit()

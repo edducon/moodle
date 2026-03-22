@@ -37,10 +37,11 @@ async function parseCourseIndex() {
         });
     });
 
-    // 1. ДОБАВЛЕНО: Собираем участников перед отправкой на сервер
-    const participantsData = await getCourseParticipants();
-
     try {
+        // Парсим преподавателей со страницы участников (параллельно)
+        const teachersPromise = parseTeachersFromParticipants();
+        const teachers = await teachersPromise;
+
         const res = await fetch("http://127.0.0.1:8000/api/course/sync", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -49,7 +50,7 @@ async function parseCourseIndex() {
                 title: document.title,
                 sections: Array.from(sectionsMap.values()),
                 viewer_role: getViewerRole(),
-                participants: participantsData // 2. ДОБАВЛЕНО: Передаем их в Python
+                participants: teachers  // Передаём только преподавателей (или пустой массив)
             })
         });
 

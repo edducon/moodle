@@ -84,28 +84,50 @@ class SemanticRouter:
         self.intent_examples = {
             "teacher_info": [
                 "кто преподаватель", "кто ведет курс", "контакты преподавателя",
-                "как связаться с преподавателем", "кто лектор", "чья это дисциплина"
+                "как связаться с преподавателем", "кто лектор", "чья это дисциплина",
+                "имя преподавателя", "почта преподавателя", "кто читает лекции"
             ],
             "navigate": [
                 "с чего начать", "что делать первым", "куда идти",
-                "первое задание", "как начать курс", "какая первая тема"
+                "первое задание", "как начать курс", "какая первая тема",
+                "что дальше", "а дальше", "следующее задание", "следующая тема",
+                "что после этого", "куда идти после лекции", "что после лекции",
+                "следующий шаг", "продолжить курс", "что делать потом",
+                "куда идти после", "что после задания"
             ],
             "grading": [
                 "как получить оценку", "система оценивания", "критерии оценки",
                 "как сдать экзамен", "как получить зачет", "баллы за задания",
-                "как получить 5", "как получить автомат", "что будет на экзамене",
+                "как получить 5", "что будет на экзамене",
                 "как получить пятерку", "как получить пятерочку", "получить хорошую оценку",
                 "что нужно для отличника", "минимум для зачета",
                 "система оценки дисциплины", "итоговая оценка за курс",
-                "условия получения отличной оценки", "требования для получения пятерки"
+                "условия получения отличной оценки", "требования для получения пятерки",
+                "условия получения зачтено", "критерии выставления оценки",
+                "оценка без экзамена", "результаты семестровой работы", "порядок выставления итоговой оценки",
+                "как получить автомат", "автоматическая оценка", "автомат по предмету",
+                "условия зачета", "условия экзамена", "сколько баллов нужно",
+                "сколько баллов за лабу", "баллы за лабораторную", "что нужно для пятерки"
             ],
             "find_deadline": [
                 "когда сдавать", "дедлайн", "срок сдачи", "до какого числа",
-                "горят сроки", "какие ближайшие дедлайны"
+                "горят сроки", "какие ближайшие дедлайны",
+                "ближайший дедлайн", "какой дедлайн", "следующий дедлайн",
+                "когда сдавать лабу", "когда сдавать задание", "срок сдачи задания",
+                "до какого числа задание", "до какого числа лабу",
+                "когда дедлайн по практическому", "срок сдачи практического занятия"
             ],
             "course_overview": [
                 "из чего состоит курс", "что в курсе", "структура курса",
-                "сколько заданий", "сколько лекций", "о чем этот предмет"
+                "сколько заданий", "о чем этот предмет",
+                "сколько лекций", "сколько лабораторных", "сколько тестов",
+                "сколько практических занятий", "сколько всего заданий на курсе",
+                "содержание курса", "план курса", "темы курса"
+            ],
+            "smalltalk": [
+                "привет", "здравствуй", "как дела", "кто ты", "спасибо",
+                "понятно", "ок", "окей", "да", "нет", "зайка", "схерали",
+                "круто", "ясно", "ага", "хорошо", "помоги", "че каво"
             ]
         }
 
@@ -130,7 +152,9 @@ class SemanticRouter:
         if best_score >= threshold:
             best_intent = self.labels[best_idx]
 
-            # Query Expansion
+            if best_intent == "smalltalk":
+                return "smalltalk", query
+
             intent_scores = [
                 (similarities[i], self.phrases[i])
                 for i in range(len(self.labels)) if self.labels[i] == best_intent
@@ -220,7 +244,9 @@ class FeedbackRequest(BaseModel):
 ANAPHORA_MARKERS = [
     "а дальше", "что потом", "после этого", "а после",
     "ее", "её", "его", "их", "это", "эту", "этот", "этом", "там",
-    "а как", "как это", "а она", "а оно", "он", "она", "они", "туда"
+    "а как", "как это", "а она", "а оно", "он", "она", "они", "туда",
+    "дальше", "следующее", "следующий", "потом", "после",
+    "ещё где", "где ещё", "а ещё", "ещё раз"
 ]
 
 SELF_CONTAINED_MARKERS = [
@@ -276,6 +302,10 @@ def course_module_visible_for_role(module_data: Dict[str, Any], viewer_role: Opt
 def split_text_into_chunks(text: str, chunk_size: int = 450, overlap: int = 150) -> List[str]:
     if not text: return []
     text = re.sub(r"Печатать книгу.*?Оглавление", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    # === Вторая линия защиты от интерфейса преподавателя ===
+    text = re.sub(r"Просмотр всех ответов[\s\S]*?(?=МЕТАДАННЫЕ|$)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d{3}-\d{3,4}\b\s*", "", text)
 
     paragraphs = re.split(r"\n+", text.strip())
     chunks = []
@@ -386,7 +416,7 @@ def extract_last_bot_navigation_target(history: List[ChatHistoryItem]) -> str:
         if m: return m.group(1).strip()
 
         m = re.search(
-            r"(лекци[ия]\s*№?\s*\d+|лаборатор\w+\s*работ\w*\s*№?\s*\d+|практическ\w+\s*\w*\s*№?\s*\d+|тем[аы]\s*№?\s*\d+)",
+            r"(лекци[ия]\s*№?\s*\d+|лаборатор\w+\s*работ\w*\s*№?\s*\d+|практическ\w+\s*\w*\s*№?\s*\d+|тем[аы]\s*№?\s*\d+|модуль\s*№?\s*\d+|раздел\s*№?\s*\d+)",
             text, flags=re.IGNORECASE)
         if m: return m.group(1).strip()
     return ""
@@ -442,6 +472,17 @@ def build_course_ontology(course_modules: List[Dict[str, Any]], deadlines: List[
 # =========================
 
 def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bool) -> Dict[str, Any]:
+    msg_normalized = normalize_text(enriched_msg)
+    words = msg_normalized.split()
+
+    whitelist_markers = [
+        "дедлайн", "лекци", "задани", "тест", "оценк", "препод", "начать",
+        "экзамен", "автомат", "зачет", "сдавать", "баллы", "правил", "курс", "срок",
+        "лаб", "практическ", "сколько", "структур", "условия", "дальше", "следующ"
+    ]
+    if len(words) <= 2 and not any(marker in msg_normalized for marker in whitelist_markers):
+        return {"action": "smalltalk", "scope": "generic", "query": enriched_msg}
+
     intent, search_query = semantic_router.classify(enriched_msg)
     route = {"action": intent, "scope": "generic", "query": search_query}
 
@@ -491,24 +532,49 @@ def exec_navigation(course_modules: List[Dict[str, Any]], history: List[ChatHist
     return {"facts": {"mode": "start", "start_module": start}, "targets": [start] if start else []}
 
 
-def exec_course_overview(ontology: Dict[str, Any]) -> Dict[str, Any]:
-    return {"facts": {"course_title": ontology.get("course_title", ""), "counts": ontology.get("counts", {}),
-                      "start_module": ontology.get("start_module")},
-            "targets": [ontology.get("start_module")] if ontology.get("start_module") else []}
+def exec_course_overview(ontology: Dict[str, Any], course_modules: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ordered = order_modules(course_modules)
+    # Собираем краткий список названий модулей по типам для LLM
+    learning_titles = [m["title"] for m in ordered if m["kind"] == "learning"][:10]
+    assignment_titles = [m["title"] for m in ordered if m["kind"] == "assignment"][:10]
+    quiz_titles = [m["title"] for m in ordered if m["kind"] == "quiz"][:10]
+
+    return {"facts": {
+        "course_title": ontology.get("course_title", ""),
+        "counts": ontology.get("counts", {}),
+        "start_module": ontology.get("start_module"),
+        "learning_modules": learning_titles,
+        "assignment_modules": assignment_titles,
+        "quiz_modules": quiz_titles,
+    }, "targets": [ontology.get("start_module")] if ontology.get("start_module") else []}
 
 
 def exec_deadlines(deadlines: List[DeadlineItem], scope: str) -> Dict[str, Any]:
-    return {"facts": {"has_deadlines": bool(deadlines), "deadlines": deadlines[:10], "scope": scope}, "targets": []}
+    if not deadlines:
+        return {"facts": {
+            "has_deadlines": False,
+            "deadlines": [],
+            "scope": scope,
+            "указание_ии": "На этом курсе не установлены конкретные сроки сдачи заданий в системе. Рекомендуй обратиться к преподавателю за информацией о сроках."
+        }, "targets": []}
+    return {"facts": {"has_deadlines": True, "deadlines": deadlines[:10], "scope": scope}, "targets": []}
 
 
-def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str) -> Dict[str, Any]:
+def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str, intent: str = "") -> Dict[str, Any]:
     candidates, score_map = retrieve_candidates(db=db, course_id=course_id, viewer_role=viewer_role, search_query=query)
+
+    # Для grading-запросов принудительно подтягиваем модули с "оценк"/"система оценки" в заголовке
+    if intent == "grading":
+        grading_keywords = ["оценк", "система оценки", "оценивани", "рейтинг"]
+        grading_candidates = [c for c in candidates if any(kw in normalize_text(c.get("title", "")) for kw in grading_keywords)]
+        other_candidates = [c for c in candidates if c not in grading_candidates]
+        candidates = grading_candidates + other_candidates
 
     for c in candidates:
         snippet_raw = c.get("content_text", "")[:80].strip()
         c["snippet"] = re.sub(r'\s+', ' ', snippet_raw)
 
-    return {"facts": {"query": query, "candidates": candidates[:3]}, "targets": candidates[:1], "score_map": score_map}
+    return {"facts": {"query": query, "candidates": candidates[:5]}, "targets": candidates[:1], "score_map": score_map}
 
 
 # =========================
@@ -527,11 +593,23 @@ def generate_response(
 
     prompt = f"""
 Ты интеллектуальный помощник для студентов курса в Moodle.
-Отвечай вежливо, естественно и полезно.
+Отвечай вежливо, естественно и кратко (максимум 3-4 предложения).
 Используй ТОЛЬКО переданные факты, ничего не придумывай.
-Если студент спрашивает определение термина, найди наиболее полное определение в фактах и приведи его ПОЛНОСТЬЮ.
-Если по фактам нет нужной информации, честно скажи, что не обладаешь такими данными.
-Если предлагаешь куда-то перейти, мягко сошлись на это.
+Ни в коем случае не выдумывай правила прохождения тестов или экзаменов (про время, падежи ответов, попытки и т.д.), если этого нет в фактах.
+Никогда не используй фразы "прошу прощения", "по умолчанию", "как правило", "из предоставленной информации неясно".
+Никогда не вставляй URL-ссылки прямо в текст ответа — студент сам нажмет на кнопку перехода под твоим сообщением.
+
+Словарь студенческого сленга для понимания запросов:
+- "автомат" = автоматическая оценка без экзамена по результатам семестра
+- "хвост" = несданный экзамен или задолженность
+- "пересдача" = повторная сдача экзамена или теста
+- "лаба" = лабораторная работа
+- "зачетка" = зачетная книжка
+
+Если в фактах недостаточно информации для точного ответа на вопрос об образовательном процессе — честно скажи, что не знаешь, и порекомендуй обратиться к преподавателю. Не угадывай!
+Если студент спрашивает, нужно ли что-то делать (смотреть лекции, проходить тесты по порядку) — опирайся ТОЛЬКО на требования из фактов (например, "Условия завершения элемента"). Если требования нет — скажи, что обязательного требования не нашел, но порекомендуй это сделать для лучшего усвоения материала, и предложи уточнить у преподавателя.
+Если студент спрашивает определение термина — приведи его ПОЛНОСТЬЮ из фактов.
+Если в фактах написано, что преподаватель не указан — так и скажи, не придумывай.
 
 Верни СТРОГО JSON:
 {{
@@ -597,13 +675,15 @@ def sync_course(data: CourseData, db: Session = Depends(get_db)):
         db.add(db_course)
         is_new = True
 
-    if data.participants is not None:
+    # Обновляем преподавателей ТОЛЬКО если пришли непустые данные
+    # Если студент прислал пустой массив (не видит преподов) — не трогаем существующие записи
+    if data.participants and len(data.participants) > 0:
         db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).delete()
         for p in data.participants:
             db.add(CourseParticipant(
                 course_id=data.course_id,
                 name=p.get("name", ""),
-                role=p.get("role", "Студент"),
+                role=p.get("role", "Преподаватель"),
                 group_name=p.get("group_name", "")
             ))
 
@@ -698,8 +778,10 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
 
     execution: Dict[str, Any] = {"facts": {}, "targets": []}
 
-    if route["action"] == "teacher_info":
-        # БЕРЕМ ИНФОРМАЦИЮ ИЗ БАЗЫ ДАННЫХ
+    if route["action"] == "smalltalk":
+        execution["facts"][
+            "указание_ии"] = "Это неформальный, бессмысленный запрос или приветствие. Поздоровайся, если это приветствие, или просто вежливо скажи, что ты помощник по курсу, и предложи задать конкретный вопрос по учебе."
+    elif route["action"] == "teacher_info":
         teachers_from_db = db.query(CourseParticipant).filter(
             CourseParticipant.course_id == data.course_id,
             CourseParticipant.role.ilike("%преподаватель%")
@@ -709,23 +791,28 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
             names = [p.name for p in teachers_from_db]
             execution["facts"]["преподаватели"] = "Преподаватели курса: " + ", ".join(names)
         else:
-            execution["facts"]["преподаватели"] = data.teachers or "Информация о преподавателях не указана."
+            fallback_teachers = data.teachers.strip() if data.teachers else ""
+            execution["facts"][
+                "преподаватели"] = fallback_teachers if fallback_teachers else "В системе нет информации о преподавателях этого курса."
 
     elif route["action"] == "find_deadline":
         execution = exec_deadlines(data.deadlines, "generic")
     elif route["action"] == "course_overview":
-        execution = exec_course_overview(ontology)
+        execution = exec_course_overview(ontology, course_modules)
     elif route["action"] == "navigate":
         execution = exec_navigation(course_modules, data.history)
     else:
-        execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"])
+        execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"], intent=route["action"])
 
     if data.grades: execution["facts"]["оценки_студента"] = data.grades
     if data.assign_status: execution["facts"]["статус_задания"] = data.assign_status
-    if data.teachers and route["action"] != "teacher_info": execution["facts"]["преподаватели_курса"] = data.teachers
+
+    if data.teachers and route["action"] != "teacher_info" and "преподаватели" not in execution["facts"]:
+        execution["facts"]["преподаватели_курса"] = data.teachers
 
     if execution.get("facts", {}).get("candidates"):
-        for idx, c in enumerate(execution["facts"]["candidates"][:3], start=1):
+        # Обновили debug context для отображения до 5 кандидатов
+        for idx, c in enumerate(execution["facts"]["candidates"][:5], start=1):
             score_val = execution.get("score_map", {}).get(c["id"], 0)
             debug_context.append(
                 {"title": f"{idx}. {c['title']}", "text": c["content_text"][:180] + "...", "score": score_val})
