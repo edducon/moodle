@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
@@ -94,7 +95,9 @@ class SemanticRouter:
                 "как сдать экзамен", "как получить зачет", "баллы за задания",
                 "как получить 5", "как получить автомат", "что будет на экзамене",
                 "как получить пятерку", "как получить пятерочку", "получить хорошую оценку",
-                "что нужно для отличника", "минимум для зачета"
+                "что нужно для отличника", "минимум для зачета",
+                "система оценки дисциплины", "итоговая оценка за курс",
+                "условия получения отличной оценки", "требования для получения пятерки"
             ],
             "find_deadline": [
                 "когда сдавать", "дедлайн", "срок сдачи", "до какого числа",
@@ -148,24 +151,14 @@ semantic_router = SemanticRouter(embedder)
 # =========================
 # SCHEMAS
 # =========================
-class ParticipantItem(BaseModel):
-    name: str
-    role: str
-    group_name: str = ""
 
 class CourseData(BaseModel):
     course_id: str
     title: str
     sections: List[Dict[str, Any]]
     viewer_role: Optional[str] = None
-    participants: List[ParticipantItem] = []
+    participants: Optional[List[Dict[str, Any]]] = []
 
-class CourseData(BaseModel):
-    course_id: str
-    title: str
-    sections: List[Dict[str, Any]]
-    viewer_role: Optional[str] = None
-    participants: List[ParticipantItem] = []
 
 class ModuleUpdateData(BaseModel):
     course_id: str
@@ -264,23 +257,6 @@ def enrich_query_with_history(user_msg: str, history: List[ChatHistoryItem]) -> 
         clean_bot_msg = re.sub(r'<[^>]+>', '', last_bot_msg)
         return f"{clean_bot_msg[:80]} {msg}"
     return msg
-
-def extract_json_from_text(text: str) -> dict:
-    try:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1:
-            raw = text[start:end + 1]
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                raw = re.sub(r",\s*}", "}", raw)
-                raw = re.sub(r",\s*\]", "]", raw)
-                raw = raw.replace("\n", " ").replace("\r", "")
-                return json.loads(raw)
-    except Exception:
-        pass
-    return {}
 
 
 def db_module_visible_for_role(mod: ModuleIndex, viewer_role: Optional[str]) -> bool:
@@ -446,7 +422,7 @@ def choose_default_start(course_modules: List[Dict[str, Any]]) -> Optional[Dict[
 
 
 def build_course_ontology(course_modules: List[Dict[str, Any]], deadlines: List[DeadlineItem], course_title: str) -> \
-Dict[str, Any]:
+        Dict[str, Any]:
     ordered = order_modules(course_modules)
     return {
         "course_title": course_title,
@@ -501,15 +477,6 @@ def retrieve_candidates(db: Session, course_id: str, viewer_role: str, search_qu
     return candidates, score_map
 
 
-def retrieve_knowledge_base(db: Session, query: str) -> List[str]:
-    query_vector = embedder.encode([query])[0].tolist()
-    distance_col = KnowledgeItem.embedding.cosine_distance(query_vector)
-    results = db.query(KnowledgeItem, KnowledgeTopic).join(KnowledgeTopic,
-                                                           KnowledgeItem.topic_id == KnowledgeTopic.id).order_by(
-        distance_col).limit(3).all()
-    return [f"Правило из раздела '{topic.title}': {item.content}" for item, topic in results]
-
-
 # =========================
 # EXECUTORS
 # =========================
@@ -536,6 +503,11 @@ def exec_deadlines(deadlines: List[DeadlineItem], scope: str) -> Dict[str, Any]:
 
 def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str) -> Dict[str, Any]:
     candidates, score_map = retrieve_candidates(db=db, course_id=course_id, viewer_role=viewer_role, search_query=query)
+
+    for c in candidates:
+        snippet_raw = c.get("content_text", "")[:80].strip()
+        c["snippet"] = re.sub(r'\s+', ' ', snippet_raw)
+
     return {"facts": {"query": query, "candidates": candidates[:3]}, "targets": candidates[:1], "score_map": score_map}
 
 
@@ -557,6 +529,7 @@ def generate_response(
 Ты интеллектуальный помощник для студентов курса в Moodle.
 Отвечай вежливо, естественно и полезно.
 Используй ТОЛЬКО переданные факты, ничего не придумывай.
+Если студент спрашивает определение термина, найди наиболее полное определение в фактах и приведи его ПОЛНОСТЬЮ.
 Если по фактам нет нужной информации, честно скажи, что не обладаешь такими данными.
 Если предлагаешь куда-то перейти, мягко сошлись на это.
 
@@ -622,35 +595,21 @@ def sync_course(data: CourseData, db: Session = Depends(get_db)):
     else:
         db_course = Course(course_id=data.course_id, title=data.title, content=data.sections)
         db.add(db_course)
-        db.commit()  # Сохраняем курс, чтобы привязать к нему участников
         is_new = True
 
-    # Обновляем участников с защитой от перезаписи студентами
-    if data.participants:
-        current_count = db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).count()
+    if data.participants is not None:
+        db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).delete()
+        for p in data.participants:
+            db.add(CourseParticipant(
+                course_id=data.course_id,
+                name=p.get("name", ""),
+                role=p.get("role", "Студент"),
+                group_name=p.get("group_name", "")
+            ))
 
-        # Разрешаем запись, если это препод ИЛИ если база пока пустая
-        if data.viewer_role == "teacher" or current_count == 0:
-            db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).delete()
-
-            new_participants = []
-            for p in data.participants:
-                # Защита от пустых имен
-                if not p.name.strip():
-                    continue
-
-                new_participants.append(CourseParticipant(
-                    course_id=data.course_id,
-                    name=p.name,
-                    role=p.role,
-                    group_name=p.group_name
-                ))
-            db.bulk_save_objects(new_participants)
     db.commit()
     indexed_count = db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count()
-    needs_sync = is_new or (indexed_count == 0)
-
-    return {"status": "success", "needs_initial_sync": needs_sync}
+    return {"status": "success", "needs_initial_sync": is_new or (indexed_count == 0)}
 
 
 @app.post("/api/module/update")
@@ -721,25 +680,7 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         return {"reply": "Курс еще не проиндексирован.", "targets": []}
 
     db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
-    if not db_course:
-        return {"reply": "Курс не найден.", "targets": []}
-
-    db_participants = db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).all()
-
-    teachers = []
-    students = []
-    for p in db_participants:
-        info = f"- {p.name} (Группа: {p.group_name})" if p.group_name else f"- {p.name}"
-        if "преподаватель" in p.role.lower() or "ассистент" in p.role.lower() or "создатель" in p.role.lower():
-            teachers.append(info)
-        else:
-            students.append(info)
-
-    participants_str = ""
-    if teachers:
-        participants_str += "ПРЕПОДАВАТЕЛИ:\n" + "\n".join(teachers) + "\n\n"
-    if students:
-        participants_str += "СТУДЕНТЫ:\n" + "\n".join(students)
+    if not db_course: return {"reply": "Курс не найден.", "targets": []}
 
     user_msg = safe_strip(data.message)
     viewer_role = data.viewer_role or "student"
@@ -758,7 +699,18 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     execution: Dict[str, Any] = {"facts": {}, "targets": []}
 
     if route["action"] == "teacher_info":
-        execution["facts"]["участники_курса"] = participants_str or "Информация об участниках не найдена."
+        # БЕРЕМ ИНФОРМАЦИЮ ИЗ БАЗЫ ДАННЫХ
+        teachers_from_db = db.query(CourseParticipant).filter(
+            CourseParticipant.course_id == data.course_id,
+            CourseParticipant.role.ilike("%преподаватель%")
+        ).all()
+
+        if teachers_from_db:
+            names = [p.name for p in teachers_from_db]
+            execution["facts"]["преподаватели"] = "Преподаватели курса: " + ", ".join(names)
+        else:
+            execution["facts"]["преподаватели"] = data.teachers or "Информация о преподавателях не указана."
+
     elif route["action"] == "find_deadline":
         execution = exec_deadlines(data.deadlines, "generic")
     elif route["action"] == "course_overview":
@@ -768,12 +720,9 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     else:
         execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"])
 
-    if data.grades:
-        execution["facts"]["оценки_студента"] = data.grades
-    if data.assign_status:
-        execution["facts"]["статус_задания"] = data.assign_status
-    if participants_str and route["action"] != "teacher_info":
-        execution["facts"]["участники_курса"] = participants_str
+    if data.grades: execution["facts"]["оценки_студента"] = data.grades
+    if data.assign_status: execution["facts"]["статус_задания"] = data.assign_status
+    if data.teachers and route["action"] != "teacher_info": execution["facts"]["преподаватели_курса"] = data.teachers
 
     if execution.get("facts", {}).get("candidates"):
         for idx, c in enumerate(execution["facts"]["candidates"][:3], start=1):
@@ -789,7 +738,7 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         ontology=ontology
     )
 
-    targets = [{"id": t["moodle_id"], "url": t["url"], "title": t["title"], "snippet": ""} for t in
+    targets = [{"id": t["moodle_id"], "url": t["url"], "title": t["title"], "snippet": t.get("snippet", "")} for t in
                response_data.get("targets", []) if t]
 
     try:
