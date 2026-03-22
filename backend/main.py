@@ -994,6 +994,7 @@ Targets:
 def sync_course(data: CourseData, db: Session = Depends(get_db)):
     db_course = db.query(Course).filter(Course.course_id == data.course_id).first()
 
+    is_new = False
     if db_course:
         db_course.title = data.title
         db_course.content = data.sections
@@ -1001,9 +1002,16 @@ def sync_course(data: CourseData, db: Session = Depends(get_db)):
     else:
         db_course = Course(course_id=data.course_id, title=data.title, content=data.sections)
         db.add(db_course)
+        is_new = True
 
     db.commit()
-    return {"status": "success"}
+
+    # ПРОВЕРЯЕМ, ЕСТЬ ЛИ В БАЗЕ ЭЛЕМЕНТЫ ЭТОГО КУРСА
+    indexed_count = db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count()
+    needs_sync = is_new or (indexed_count == 0)
+
+    # Отправляем фронтенду сигнал, нужно ли запускать паука
+    return {"status": "success", "needs_initial_sync": needs_sync}
 
 
 @app.post("/api/module/update")

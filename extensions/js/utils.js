@@ -5,10 +5,21 @@ async function getCourseDOMs() {
     if (window.MoodleBot.courseDOMsCache) return window.MoodleBot.courseDOMsCache;
 
     const doms = [document];
-    const sectionLinks = Array.from(document.querySelectorAll('h3.sectionname a[href*="section="]')).map(a => a.href);
+
+    // НОВОЕ: Ищем ссылки на скрытые секции во ВСЕХ форматах (недели, темы, сетка)
+    const linkNodes = document.querySelectorAll(
+        'h3.sectionname a[href*="section="], ' +          /* Обычный формат с пагинацией */
+        '.thegrid a.grid-section-inner[href*="section="], ' + /* Формат "Сетка" (Grid) */
+        '.course-content .section-summary a[href*="section="]' /* Свернутые темы */
+    );
+
+    // Собираем уникальные ссылки, чтобы не качать одну страницу дважды
+    let links = new Set();
+    linkNodes.forEach(a => links.add(a.href));
+    const sectionLinks = Array.from(links);
 
     if (sectionLinks.length > 0) {
-        console.log(`[Moodle Bot] Найдена пагинация. Загружаю ${sectionLinks.length} скрытых разделов...`);
+        console.log(`[Moodle Bot] Найдена пагинация/сетка. Загружаю ${sectionLinks.length} скрытых разделов...`);
         for (let i = 0; i < sectionLinks.length; i += 3) {
             const chunk = sectionLinks.slice(i, i + 3);
             const promises = chunk.map(async (url) => {
@@ -20,7 +31,7 @@ async function getCourseDOMs() {
             });
             const results = await Promise.all(promises);
             doms.push(...results.filter(Boolean));
-            await new Promise(r => setTimeout(r, 200));
+            await new Promise(r => setTimeout(r, 200)); // небольшая пауза, чтобы не дудосить сервер
         }
     }
 
@@ -52,15 +63,6 @@ function hasRestrictionMarkers(actElement) {
     return txt.includes('доступно') || txt.includes('недоступно') || txt.includes('услов');
 }
 
-function extractVisibilityInfo(actElement) {
-    const text = cleanText(actElement?.innerText || '');
-    return {
-        is_hidden: isActivityHidden(actElement),
-        has_restrictions: hasRestrictionMarkers(actElement) && !isActivityHidden(actElement),
-        raw_text: text.slice(0, 1200)
-    };
-}
-
 function isActivityHidden(actElement) {
     if (!actElement) return false;
     if (actElement.querySelector('.hiddenactivity')) return true;
@@ -71,6 +73,97 @@ function isActivityHidden(actElement) {
         if ((b.innerText || '').toLowerCase().includes('скрыто')) return true;
     }
     return false;
+}
+
+// === УЛУЧШЕННЫЙ ПАРСЕР ИНФОРМАЦИИ ОБ ЭЛЕМЕНТЕ ===
+function extractVisibilityInfo(actElement) {
+    if (!actElement) return { is_hidden: false, has_restrictions: false, raw_text: "" };
+
+    let meta = {
+        is_hidden: isActivityHidden(actElement),
+        has_restrictions: hasRestrictionMarkers(actElement) && !isActivityHidden(actElement),
+        section_title: "", // НОВОЕ: Название темы/раздела
+        restrictions: [],
+        dates: [],
+        completion_rules: [],
+        resource_details: "",
+        inline_desc: "",
+        raw_text: cleanText(actElement.innerText || '').slice(0, 1500)
+    };
+
+    try {
+        // 0. Находим, в какой теме (разделе) находится элемент
+        const sectionNode = actElement.closest('li.section.main');
+        if (sectionNode) {
+            const secTitleNode = sectionNode.querySelector('h3.sectionname');
+            if (secTitleNode) {
+                meta.section_title = cleanText(secTitleNode.innerText);
+            }
+        }
+
+        // 1. Даты (ИСПРАВЛЕНО ДУБЛИРОВАНИЕ)
+        const datesWrapper = actElement.querySelector('.activity-dates .description-inner');
+        if (datesWrapper) {
+            // Берем только прямых детей, чтобы не хватать текст родителя
+            Array.from(datesWrapper.children).forEach(child => {
+                const txt = cleanText(child.innerText);
+                if (txt) meta.dates.push(txt);
+            });
+        } else {
+            // Фолбэк на случай другой верстки Moodle
+            const altDates = actElement.querySelector('.activity-dates');
+            if (altDates) {
+                const txt = cleanText(altDates.innerText);
+                if (txt) meta.dates.push(txt);
+            }
+        }
+
+        // 2. Условия доступа и ограничения
+        const restrictTree = actElement.querySelectorAll('.availabilityinfo li:not(.showmore)');
+        if (restrictTree.length > 0) {
+            restrictTree.forEach(li => {
+                const txt = cleanText(li.innerText);
+                if (txt) meta.restrictions.push(txt);
+            });
+        } else {
+            const restrictBox = actElement.querySelector('.availabilityinfo .description-inner');
+            if (restrictBox) {
+                let txt = cleanText(restrictBox.innerText);
+                txt = txt.replace(/^Недоступно, пока не выполнены условия:\s*/i, '').trim();
+                if (txt) meta.restrictions.push(txt);
+            }
+        }
+
+        // 3. Условия завершения (что нужно сделать студенту)
+        const completionEls = actElement.querySelectorAll('.automatic-completion-conditions span.font-weight-normal, [data-region="completion-info"] button');
+        completionEls.forEach(el => {
+            const txt = cleanText(el.innerText);
+            if (txt) meta.completion_rules.push(txt);
+        });
+
+        // 4. Детали ресурса (Вес, расширение, дата загрузки файла)
+        const resDetails = actElement.querySelector('.resourcelinkdetails');
+        if (resDetails) {
+            meta.resource_details = cleanText(resDetails.innerText);
+        }
+
+        // 5. Текст пояснений и меток (inline-описания)
+        const descEls = actElement.querySelectorAll('.activity-altcontent .description-inner, .description .description-inner > .no-overflow');
+        let descParts = [];
+        descEls.forEach(el => {
+            const txt = cleanText(el.innerText);
+            // Фильтруем то, что уже собрали в других блоках
+            if (txt && !txt.includes('Недоступно') && !txt.includes('Открыто с')) {
+                descParts.push(txt);
+            }
+        });
+        meta.inline_desc = Array.from(new Set(descParts)).join(' | ');
+
+    } catch (e) {
+        console.error("[Moodle Bot] Ошибка парсинга метаданных элемента:", e);
+    }
+
+    return meta;
 }
 
 function parseRuDate(dateStr) {
@@ -105,55 +198,57 @@ function parseRuDate(dateStr) {
     return null;
 }
 
-// === ОБНОВЛЕНО: СОБИРАЕМ ПОЛНУЮ КАРТУ КУРСА С УСЛОВИЯМИ ===
 function getCourseMap() {
     let map = [];
-    document.querySelectorAll('li.section.main').forEach(sec => {
-        let secTitleEl = sec.querySelector('h3.sectionname');
-        if (!secTitleEl) return;
-        let secTitle = secTitleEl.innerText.trim();
+    // Берем все скачанные страницы курса (главную + все скрытые темы)
+    const doms = window.MoodleBot.courseDOMsCache || [document];
 
-        let secDescEl = sec.querySelector('.summarytext');
-        let secDesc = secDescEl ? secDescEl.innerText.replace(/\n/g, ' ').trim() : "";
+    doms.forEach(doc => {
+        // Исключаем .section-summary, чтобы не дублировать блоки
+        doc.querySelectorAll('li.section.main:not(.section-summary)').forEach(sec => {
+            let secTitleEl = sec.querySelector('h3.sectionname');
+            if (!secTitleEl) return;
+            let secTitle = secTitleEl.innerText.trim();
 
-        let items = [];
-        sec.querySelectorAll('li.activity').forEach(act => {
-            let nameEl = act.querySelector('.instancename');
-            if (!nameEl) return;
+            let secDescEl = sec.querySelector('.summarytext');
+            let secDesc = secDescEl ? secDescEl.innerText.replace(/\n/g, ' ').trim() : "";
 
-            let moodleId = act.id; // НОВОЕ: Забираем системный ID (например, module-12345)
+            let items = [];
+            sec.querySelectorAll('li.activity').forEach(act => {
+                let nameEl = act.querySelector('.instancename');
+                if (!nameEl) return;
 
-            let clone = nameEl.cloneNode(true);
-            clone.querySelectorAll('.accesshide').forEach(e => e.remove());
-            let itemName = clone.innerText.trim();
+                let moodleId = act.id;
+                let clone = nameEl.cloneNode(true);
+                clone.querySelectorAll('.accesshide').forEach(e => e.remove());
+                let itemName = clone.innerText.trim();
 
-            let tags = [];
-            if (act.classList.contains('hiddenactivity') || act.querySelector('.badge-warning')) {
-                tags.push('[СКРЫТО]');
+                let tags = [];
+                if (act.classList.contains('hiddenactivity') || act.querySelector('.badge-warning')) {
+                    tags.push('[СКРЫТО]');
+                }
+                let restriction = act.querySelector('.availabilityinfo .description-inner');
+                if (restriction) tags.push(`[УСЛОВИЕ ДОСТУПА: ${restriction.innerText.replace(/\n/g, ' ').trim()}]`);
+
+                let completion = act.querySelector('.automatic-completion-conditions');
+                if (completion) {
+                    let reqs = Array.from(completion.querySelectorAll('span.font-weight-normal')).map(e => e.innerText.trim());
+                    if (reqs.length > 0) tags.push(`[ДЛЯ ЗАВЕРШЕНИЯ НУЖНО: ${reqs.join(', ')}]`);
+                }
+
+                let tagStr = tags.length > 0 ? ` ${tags.join(' ')}` : '';
+                items.push(`ID: ${moodleId} | ${itemName}${tagStr}`);
+            });
+
+            if (items.length > 0) {
+                let descStr = secDesc ? `\n  Описание/Правила: ${secDesc}` : '';
+                map.push(`Раздел [${secTitle}]:${descStr}\n  ` + items.join('\n  '));
             }
-            let restriction = act.querySelector('.availabilityinfo .description-inner');
-            if (restriction) tags.push(`[УСЛОВИЕ ДОСТУПА: ${restriction.innerText.replace(/\n/g, ' ').trim()}]`);
-
-            let completion = act.querySelector('.automatic-completion-conditions');
-            if (completion) {
-                let reqs = Array.from(completion.querySelectorAll('span.font-weight-normal')).map(e => e.innerText.trim());
-                if (reqs.length > 0) tags.push(`[ДЛЯ ЗАВЕРШЕНИЯ НУЖНО: ${reqs.join(', ')}]`);
-            }
-
-            let tagStr = tags.length > 0 ? ` ${tags.join(' ')}` : '';
-            // НОВОЕ: Скармливаем ИИ строчку в формате "ID: module-xxx | Название [ТЕГИ]"
-            items.push(`ID: ${moodleId} | ${itemName}${tagStr}`);
         });
-
-        if (items.length > 0) {
-            let descStr = secDesc ? `\n  Описание/Правила: ${secDesc}` : '';
-            map.push(`Раздел [${secTitle}]:${descStr}\n  ` + items.join('\n  '));
-        }
     });
     return map.join('\n\n').substring(0, 3000);
 }
 
-// === НОВОЕ: ПОИСК ПРЕПОДАВАТЕЛЕЙ КУРСА ===
 async function getCourseTeachers() {
     const courseId = getCourseId();
     if (!courseId) return "Преподаватели неизвестны";
@@ -187,36 +282,28 @@ async function getCourseTeachers() {
     }
 }
 
-// === НОВОЕ: ПАРСИНГ ЛОКАЛЬНОГО КОНТЕКСТА СТРАНИЦЫ ===
 function getCurrentPageContext() {
     let context = [];
-
-    // 1. Описание задания/страницы
     let intro = document.querySelector('.activity-description #intro') || document.querySelector('.box.generalbox');
     if (intro) context.push("ОПИСАНИЕ ИЛИ УСЛОВИЯ: " + intro.innerText.replace(/\n/g, ' ').trim());
 
-    // 2. Сроки
     let dates = document.querySelector('.activity-dates');
     if (dates) context.push("СРОКИ: " + dates.innerText.replace(/\n/g, ' ').trim());
 
-    // 3. Специфичные правила тестов
     let quizInfo = document.querySelectorAll('.quizinfo p');
     if (quizInfo.length > 0) {
         let rules = Array.from(quizInfo).map(p => p.innerText.trim());
         context.push("ПРАВИЛА ТЕСТА: " + rules.join(' | '));
     }
 
-    // 4. Требования
     let conditions = document.querySelector('.automatic-completion-conditions');
     if (conditions) {
         let reqs = Array.from(conditions.querySelectorAll('.badge')).map(e => e.innerText.replace(/\n/g, ' ').trim());
         if (reqs.length > 0) context.push("СТАТУС ВЫПОЛНЕНИЯ ТРЕБОВАНИЙ: " + reqs.join(' | '));
     }
-
     return context.length > 0 ? context.join('\n') : "";
 }
 
-// === НОВОЕ: ПАРСИНГ ЖУРНАЛА ОЦЕНОК ===
 function getStudentGrades() {
     let gradesTable = document.querySelector('table.user-grade');
     if (!gradesTable) return "";
@@ -235,7 +322,6 @@ function getStudentGrades() {
     return results.length > 0 ? "ВЫПИСКА ОЦЕНОК СТУДЕНТА:\n" + results.join('\n') : "";
 }
 
-// === НОВОЕ: ПАРСИНГ СТАТУСА КОНКРЕТНОЙ ЛАБЫ ===
 function getAssignmentStatus() {
     let statusTable = document.querySelector('.submissionstatustable table');
     if (!statusTable) return "";
@@ -291,7 +377,14 @@ function extractMeaningfulContent(doc) {
 }
 
 function shouldIndexModuleType(type) {
-    return ['page', 'resource', 'assign', 'book', 'quiz', 'url', 'label', 'lesson', 'folder', 'forum', 'chat', 'checklist'].includes(type);
+    // Если тип пустой, игнорируем
+    if (!type) return false;
+
+    // Если нужно игнорировать какие-то конкретные системные модули,
+    // можно добавить их сюда. Но по умолчанию теперь разрешаем ВСЕ типы.
+    const ignoredTypes = ['scorm', 'feedback'];
+
+    return !ignoredTypes.includes(type);
 }
 
 function isFileActivity(act) {
