@@ -85,7 +85,8 @@ class SemanticRouter:
             "teacher_info": [
                 "кто преподаватель", "кто ведет курс", "контакты преподавателя",
                 "как связаться с преподавателем", "кто лектор", "чья это дисциплина",
-                "имя преподавателя", "почта преподавателя", "кто читает лекции"
+                "имя преподавателя", "почта преподавателя", "кто читает лекции",
+                "кто препод", "как зовут препода", "препод"
             ],
             "navigate": [
                 "с чего начать", "что делать первым", "куда идти",
@@ -93,7 +94,7 @@ class SemanticRouter:
                 "что дальше", "а дальше", "следующее задание", "следующая тема",
                 "что после этого", "куда идти после лекции", "что после лекции",
                 "следующий шаг", "продолжить курс", "что делать потом",
-                "куда идти после", "что после задания"
+                "куда идти после", "что после задания", "открой", "перейди"
             ],
             "grading": [
                 "как получить оценку", "система оценивания", "критерии оценки",
@@ -119,10 +120,11 @@ class SemanticRouter:
             ],
             "course_overview": [
                 "из чего состоит курс", "что в курсе", "структура курса",
-                "сколько заданий", "о чем этот предмет",
-                "сколько лекций", "сколько лабораторных", "сколько тестов",
-                "сколько практических занятий", "сколько всего заданий на курсе",
-                "содержание курса", "план курса", "темы курса"
+                "сколько заданий в курсе", "о чем этот предмет",
+                "сколько лекций в курсе", "сколько лабораторных в курсе",
+                "сколько практических занятий в курсе", "сколько всего заданий на курсе",
+                "содержание курса", "план курса", "какие темы в курсе",
+                "перечень модулей курса", "обзор курса"
             ],
             "smalltalk": [
                 "привет", "здравствуй", "как дела", "кто ты", "спасибо",
@@ -142,7 +144,7 @@ class SemanticRouter:
                 self.labels.append(intent)
                 self.phrases.append(phrase)
 
-    def classify(self, query: str, threshold: float = 0.55) -> Tuple[str, str]:
+    def classify(self, query: str, threshold: float = 0.60) -> Tuple[str, str]:
         q_vec = self.embedder.encode([query])[0]
 
         similarities = cosine_similarity([q_vec], self.vectors)[0]
@@ -246,7 +248,7 @@ ANAPHORA_MARKERS = [
     "ее", "её", "его", "их", "это", "эту", "этот", "этом", "там",
     "а как", "как это", "а она", "а оно", "он", "она", "они", "туда",
     "дальше", "следующее", "следующий", "потом", "после",
-    "ещё где", "где ещё", "а ещё", "ещё раз"
+    "ещё где", "где ещё", "а ещё", "ещё раз", "откуда", "где нашел"
 ]
 
 SELF_CONTAINED_MARKERS = [
@@ -302,8 +304,6 @@ def course_module_visible_for_role(module_data: Dict[str, Any], viewer_role: Opt
 def split_text_into_chunks(text: str, chunk_size: int = 450, overlap: int = 150) -> List[str]:
     if not text: return []
     text = re.sub(r"Печатать книгу.*?Оглавление", "", text, flags=re.IGNORECASE | re.DOTALL)
-
-    # === Вторая линия защиты от интерфейса преподавателя ===
     text = re.sub(r"Просмотр всех ответов[\s\S]*?(?=МЕТАДАННЫЕ|$)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b\d{3}-\d{3,4}\b\s*", "", text)
 
@@ -480,11 +480,24 @@ def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bo
         "экзамен", "автомат", "зачет", "сдавать", "баллы", "правил", "курс", "срок",
         "лаб", "практическ", "сколько", "структур", "условия", "дальше", "следующ"
     ]
-    if len(words) <= 2 and not any(marker in msg_normalized for marker in whitelist_markers):
-        return {"action": "smalltalk", "scope": "generic", "query": enriched_msg}
 
-    intent, search_query = semantic_router.classify(enriched_msg)
-    route = {"action": intent, "scope": "generic", "query": search_query}
+    # 1. Проверка на Smalltalk
+    if len(words) <= 2 and not any(marker in msg_normalized for marker in whitelist_markers):
+        return {"action": "smalltalk", "scope": "generic", "query": enriched_msg, "original_intent": "smalltalk"}
+
+    # 2. Защита терминов от "галлюцинаций" роутера
+    grading_keywords = ["оценк", "сда", "балл", "зачет", "экзамен", "автомат", "дедлайн"]
+    is_term_query = len(words) <= 3 and not any(kw in msg_normalized for kw in grading_keywords)
+
+    if is_term_query:
+        return {"action": "answer_from_context", "scope": "generic", "query": enriched_msg,
+                "original_intent": "answer_from_context"}
+
+    # 3. Стандартный роутер
+    intent, search_query = semantic_router.classify(enriched_msg, threshold=0.60)
+
+    # Сохраняем оригинальный интент, чтобы не потерять логику (например, для grading)
+    route = {"action": intent, "scope": "generic", "query": search_query, "original_intent": intent}
 
     if intent == "find_deadline" and not has_deadlines:
         route["action"] = "answer_from_context"
@@ -534,7 +547,6 @@ def exec_navigation(course_modules: List[Dict[str, Any]], history: List[ChatHist
 
 def exec_course_overview(ontology: Dict[str, Any], course_modules: List[Dict[str, Any]]) -> Dict[str, Any]:
     ordered = order_modules(course_modules)
-    # Собираем краткий список названий модулей по типам для LLM
     learning_titles = [m["title"] for m in ordered if m["kind"] == "learning"][:10]
     assignment_titles = [m["title"] for m in ordered if m["kind"] == "assignment"][:10]
     quiz_titles = [m["title"] for m in ordered if m["kind"] == "quiz"][:10]
@@ -560,13 +572,15 @@ def exec_deadlines(deadlines: List[DeadlineItem], scope: str) -> Dict[str, Any]:
     return {"facts": {"has_deadlines": True, "deadlines": deadlines[:10], "scope": scope}, "targets": []}
 
 
-def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str, intent: str = "") -> Dict[str, Any]:
+def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str, intent: str = "") -> Dict[
+    str, Any]:
     candidates, score_map = retrieve_candidates(db=db, course_id=course_id, viewer_role=viewer_role, search_query=query)
 
-    # Для grading-запросов принудительно подтягиваем модули с "оценк"/"система оценки" в заголовке
+    # Принудительно подтягиваем модули с правилами оценок, если оригинальный интент grading
     if intent == "grading":
-        grading_keywords = ["оценк", "система оценки", "оценивани", "рейтинг"]
-        grading_candidates = [c for c in candidates if any(kw in normalize_text(c.get("title", "")) for kw in grading_keywords)]
+        grading_keywords = ["оценк", "система оценки", "оценивани", "рейтинг", "баллы", "критерии"]
+        grading_candidates = [c for c in candidates if
+                              any(kw in normalize_text(c.get("title", "")) for kw in grading_keywords)]
         other_candidates = [c for c in candidates if c not in grading_candidates]
         candidates = grading_candidates + other_candidates
 
@@ -607,13 +621,18 @@ def generate_response(
 - "зачетка" = зачетная книжка
 
 Если в фактах недостаточно информации для точного ответа на вопрос об образовательном процессе — честно скажи, что не знаешь, и порекомендуй обратиться к преподавателю. Не угадывай!
-Если студент спрашивает, нужно ли что-то делать (смотреть лекции, проходить тесты по порядку) — опирайся ТОЛЬКО на требования из фактов (например, "Условия завершения элемента"). Если требования нет — скажи, что обязательного требования не нашел, но порекомендуй это сделать для лучшего усвоения материала, и предложи уточнить у преподавателя.
 Если студент спрашивает определение термина — приведи его ПОЛНОСТЬЮ из фактов.
 Если в фактах написано, что преподаватель не указан — так и скажи, не придумывай.
 
+ВАЖНОЕ ПРАВИЛО ПРО КНОПКИ-ПЕРЕХОДЫ:
+По умолчанию студент НЕ хочет видеть кнопку-ссылку на материал, она загромождает чат.
+Устанавливай флаг "show_link": true ТОЛЬКО если студент ЯВНО просит показать источник, откуда ты взял информацию (например: "где это", "дай ссылку", "откуда инфа", "покажи").
+Для обычных вопросов (например, "что такое дефект", "какая система оценки") всегда ставь "show_link": false.
+
 Верни СТРОГО JSON:
 {{
-  "reply": "твой ответ студенту"
+  "reply": "твой ответ студенту",
+  "show_link": false
 }}
 
 --- КОНТЕКСТ ---
@@ -635,13 +654,19 @@ def generate_response(
         raw_content = resp.choices[0].message.content.strip()
         data = extract_json_from_text(raw_content)
         reply = safe_strip(data.get("reply", ""))
+        show_link = data.get("show_link", False)
+
+        # Принудительно показываем ссылку, если это именно запрос на навигацию (открой, перейди)
+        if action == "navigate":
+            show_link = True
 
         if not reply and raw_content:
             if not raw_content.startswith("{"):
                 reply = raw_content
 
         if reply:
-            return {"reply": reply, "targets": targets}
+            # Отдаем targets только если LLM решила, что ссылку нужно показать
+            return {"reply": reply, "targets": targets if show_link else []}
 
     except Exception as e:
         print(f"Ошибка LLM-генерации: {e}")
@@ -649,7 +674,9 @@ def generate_response(
             raw = resp.choices[0].message.content.strip()
             recovered = extract_json_from_text(raw)
             if recovered and recovered.get("reply"):
-                return {"reply": recovered["reply"], "targets": targets}
+                show_link = recovered.get("show_link", False)
+                if action == "navigate": show_link = True
+                return {"reply": recovered["reply"], "targets": targets if show_link else []}
             if not raw.startswith("{"):
                 return {"reply": raw, "targets": targets}
 
@@ -675,17 +702,20 @@ def sync_course(data: CourseData, db: Session = Depends(get_db)):
         db.add(db_course)
         is_new = True
 
-    # Обновляем преподавателей ТОЛЬКО если пришли непустые данные
-    # Если студент прислал пустой массив (не видит преподов) — не трогаем существующие записи
     if data.participants and len(data.participants) > 0:
-        db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).delete()
-        for p in data.participants:
-            db.add(CourseParticipant(
-                course_id=data.course_id,
-                name=p.get("name", ""),
-                role=p.get("role", "Преподаватель"),
-                group_name=p.get("group_name", "")
-            ))
+        valid_participants = [
+            p for p in data.participants
+            if p.get("role", "").strip()
+        ]
+        if valid_participants:
+            db.query(CourseParticipant).filter(CourseParticipant.course_id == data.course_id).delete()
+            for p in valid_participants:
+                db.add(CourseParticipant(
+                    course_id=data.course_id,
+                    name=p.get("name", ""),
+                    role=p.get("role", "Преподаватель"),
+                    group_name=p.get("group_name", "")
+                ))
 
     db.commit()
     indexed_count = db.query(ModuleIndex).filter(ModuleIndex.course_id == data.course_id).count()
@@ -784,12 +814,12 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     elif route["action"] == "teacher_info":
         teachers_from_db = db.query(CourseParticipant).filter(
             CourseParticipant.course_id == data.course_id,
-            CourseParticipant.role.ilike("%преподаватель%")
+            CourseParticipant.role != ""
         ).all()
 
         if teachers_from_db:
-            names = [p.name for p in teachers_from_db]
-            execution["facts"]["преподаватели"] = "Преподаватели курса: " + ", ".join(names)
+            teacher_lines = [f"{p.name} ({p.role})" if p.role else p.name for p in teachers_from_db]
+            execution["facts"]["преподаватели"] = "Преподаватели курса: " + ", ".join(teacher_lines)
         else:
             fallback_teachers = data.teachers.strip() if data.teachers else ""
             execution["facts"][
@@ -802,7 +832,9 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     elif route["action"] == "navigate":
         execution = exec_navigation(course_modules, data.history)
     else:
-        execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"], intent=route["action"])
+        # ДОСТАЕМ original_intent для правильного поиска (например, про оценки)
+        actual_intent = route.get("original_intent", route["action"])
+        execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"], intent=actual_intent)
 
     if data.grades: execution["facts"]["оценки_студента"] = data.grades
     if data.assign_status: execution["facts"]["статус_задания"] = data.assign_status
@@ -811,7 +843,6 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         execution["facts"]["преподаватели_курса"] = data.teachers
 
     if execution.get("facts", {}).get("candidates"):
-        # Обновили debug context для отображения до 5 кандидатов
         for idx, c in enumerate(execution["facts"]["candidates"][:5], start=1):
             score_val = execution.get("score_map", {}).get(c["id"], 0)
             debug_context.append(
@@ -842,7 +873,8 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
         "reply": response_data["reply"],
         "targets": targets,
         "debug_context": debug_context,
-        "debug_meta": {"action": route["action"], "router_query": route["query"]}
+        "debug_meta": {"action": route["action"], "router_query": route["query"],
+                       "original_intent": route.get("original_intent", "")}
     }
 
 

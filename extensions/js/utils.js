@@ -262,7 +262,6 @@ async function parseTeachersFromParticipants() {
     }
 
     try {
-        // Определяем базовый URL текущего сайта
         const baseUrl = window.location.origin;
         const response = await fetch(`${baseUrl}/user/index.php?id=${courseId}&perpage=5000`, { credentials: 'include' });
         const html = await response.text();
@@ -270,34 +269,43 @@ async function parseTeachersFromParticipants() {
 
         let teachers = [];
         doc.querySelectorAll('table#participants tbody tr:not(.emptyrow)').forEach(row => {
-            // Ищем роль по атрибуту data-itemtype="user_roles" — работает на любом Moodle
-            const roleSpan = row.querySelector('[data-itemtype="user_roles"]');
-            if (!roleSpan) return;
+            // Сканируем весь текст строки (без привязки к конкретным ячейкам и спанам)
+            const rowText = (row.textContent || '').toLowerCase();
 
-            const roleText = (roleSpan.innerText || '').trim();
-            // Ловим все вариации: "Преподаватель", "Ассистент", "Тьютор группы"
-            if (/преподаватель|ассистент|тьютор/i.test(roleText)) {
-                const nameCell = row.querySelector('th.c1');
-                // Группы тоже ищем по атрибуту вместо хардкода столбца
-                const groupSpan = row.querySelector('[data-itemtype="user_groups"]');
+            // Если в строке есть нужные нам слова — это препод/ассистент
+            if (/преподаватель|ассистент|тьютор/i.test(rowText)) {
+                // Имя всегда лежит в th.c1 или td.c1
+                const nameCell = row.querySelector('th.c1, td.c1');
+
                 if (nameCell) {
-                    // Убираем аватар — берём только текст
-                    const clone = nameCell.cloneNode(true);
-                    clone.querySelectorAll('img').forEach(el => el.remove());
-                    const name = (clone.innerText || '').trim();
-                    const groupName = groupSpan ? (groupSpan.innerText || '').trim() : '';
+                    const nameClone = nameCell.cloneNode(true);
+                    // Вычищаем аватарки и иконки
+                    nameClone.querySelectorAll('img, .quickediticon, .accesshide, i, a.quickeditlink').forEach(el => el.remove());
+                    let name = (nameClone.textContent || '').replace(/\s+/g, ' ').trim();
+
+                    // Если вдруг Moodle завернул имя хитрее, берем напрямую из ссылки
+                    if (!name) {
+                        const nameLink = nameCell.querySelector('a');
+                        if (nameLink) name = (nameLink.textContent || '').trim();
+                    }
+
+                    // Определяем роль для красивого вывода
+                    let roleText = 'Преподаватель';
+                    if (rowText.includes('ассистент')) roleText = 'Ассистент';
+                    if (rowText.includes('тьютор')) roleText = 'Тьютор';
 
                     if (name) {
-                        teachers.push({ name, role: roleText, group_name: groupName });
+                        teachers.push({ name, role: roleText, group_name: '' });
                     }
                 }
             }
         });
 
+        console.log(`[Moodle Bot] Найдено преподавателей: ${teachers.length}`, teachers);
         sessionStorage.setItem(cacheKey, JSON.stringify(teachers));
         return teachers;
     } catch (e) {
-        console.warn('[Moodle Bot] Не удалось спарсить преподавателей со страницы участников:', e);
+        console.warn('[Moodle Bot] Не удалось спарсить преподавателей:', e);
         return [];
     }
 }
