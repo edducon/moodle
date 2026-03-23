@@ -86,7 +86,7 @@ class SemanticRouter:
                 "кто преподаватель", "кто ведет курс", "контакты преподавателя",
                 "как связаться с преподавателем", "кто лектор", "чья это дисциплина",
                 "имя преподавателя", "почта преподавателя", "кто читает лекции",
-                "кто препод", "как зовут препода", "препод"
+                "кто препод", "как зовут препода", "препод", "преподаватель"
             ],
             "navigate": [
                 "с чего начать", "что делать первым", "куда идти",
@@ -410,8 +410,14 @@ def extract_last_bot_navigation_target(history: List[ChatHistoryItem]) -> str:
     for item in reversed(history):
         if item.role != "assistant": continue
         text = item.content or ""
+
+        # Ищем явные переходы
+        m = re.search(r'(?:Переход|Источник):\s*(.+)', text, flags=re.IGNORECASE)
+        if m: return m.group(1).strip()
+
         m = re.search(r'["«](.+?)["»]', text)
         if m: return m.group(1).strip()
+
         m = re.search(r"откройте\s+(?:сначала\s+)?(.+?)(?:\.|$)", text, flags=re.IGNORECASE)
         if m: return m.group(1).strip()
 
@@ -478,23 +484,32 @@ def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bo
     whitelist_markers = [
         "дедлайн", "лекци", "задани", "тест", "оценк", "препод", "начать",
         "экзамен", "автомат", "зачет", "сдавать", "баллы", "правил", "курс", "срок",
-        "лаб", "практическ", "сколько", "структур", "условия", "дальше", "следующ"
+        "лаб", "практическ", "сколько", "структур", "условия", "дальше", "следующ", "преподавател"
     ]
-
-    # 1. Проверка на Smalltalk
     if len(words) <= 2 and not any(marker in msg_normalized for marker in whitelist_markers):
         return {"action": "smalltalk", "scope": "generic", "query": enriched_msg, "original_intent": "smalltalk"}
 
-    # 2. Защита терминов от "галлюцинаций" роутера
-    grading_keywords = ["оценк", "сда", "балл", "зачет", "экзамен", "автомат", "дедлайн"]
-    is_term_query = len(words) <= 3 and not any(kw in msg_normalized for kw in grading_keywords)
+    # 1. Жесткий перехват для преподавателя
+    teacher_keywords = ["препод", "преподавател", "лектор", "ведет курс", "кто читает"]
+    if any(kw in msg_normalized for kw in teacher_keywords):
+        return {"action": "teacher_info", "scope": "generic", "query": enriched_msg, "original_intent": "teacher_info"}
 
-    if is_term_query:
-        return {"action": "answer_from_context", "scope": "generic", "query": enriched_msg,
-                "original_intent": "answer_from_context"}
-
-    # 3. Стандартный роутер
+    # 2. Роутер
     intent, search_query = semantic_router.classify(enriched_msg, threshold=0.60)
+
+    # 3. Защита от "галлюцинаций" роутера
+    grading_keywords = ["оценк", "сда", "балл", "зачет", "экзамен", "автомат", "дедлайн", "система", "критерии"]
+
+    # Если роутер решил, что это grading, но в запросе НЕТ слов-маркеров, это ложное срабатывание (например, "тестирование")
+    is_false_positive = (intent in ["grading", "find_deadline"]) and not any(
+        kw in msg_normalized for kw in grading_keywords)
+
+    # Если запрос до 6 слов и нет маркеров оценок, считаем его поиском термина ("что такое нагрузочное тестирование")
+    is_term_query = len(words) <= 6 and not any(kw in msg_normalized for kw in grading_keywords)
+
+    if is_false_positive or is_term_query:
+        intent = "answer_from_context"
+        search_query = enriched_msg
 
     # Сохраняем оригинальный интент, чтобы не потерять логику (например, для grading)
     route = {"action": intent, "scope": "generic", "query": search_query, "original_intent": intent}
@@ -622,12 +637,14 @@ def generate_response(
 
 Если в фактах недостаточно информации для точного ответа на вопрос об образовательном процессе — честно скажи, что не знаешь, и порекомендуй обратиться к преподавателю. Не угадывай!
 Если студент спрашивает определение термина — приведи его ПОЛНОСТЬЮ из фактов.
-Если в фактах написано, что преподаватель не указан — так и скажи, не придумывай.
+Если в фактах написано, что преподаватель не указан — так и скажи, не придумывай. Но если преподаватель передан в фактах, назови его.
 
-ВАЖНОЕ ПРАВИЛО ПРО КНОПКИ-ПЕРЕХОДЫ:
-По умолчанию студент НЕ хочет видеть кнопку-ссылку на материал, она загромождает чат.
-Устанавливай флаг "show_link": true ТОЛЬКО если студент ЯВНО просит показать источник, откуда ты взял информацию (например: "где это", "дай ссылку", "откуда инфа", "покажи").
-Для обычных вопросов (например, "что такое дефект", "какая система оценки") всегда ставь "show_link": false.
+ВАЖНОЕ ПРАВИЛО ПРО КНОПКИ-ПЕРЕХОДЫ (show_link):
+По умолчанию студент НЕ хочет видеть кнопку-ссылку на материал, она загромождает чат (ставь "show_link": false).
+Устанавливай "show_link": true ТОЛЬКО в следующих случаях:
+1. Студент ЯВНО просит показать источник или ссылку (например: "где это", "откуда инфа", "дай ссылку", "покажи").
+2. Студент просит навигацию ("перейди к лекции", "открой задание").
+Если студент спрашивает "где ты это нашел?", ответь: "Эта информация находится в материале: [Название]" и обязательно поставь "show_link": true.
 
 Верни СТРОГО JSON:
 {{
@@ -656,7 +673,6 @@ def generate_response(
         reply = safe_strip(data.get("reply", ""))
         show_link = data.get("show_link", False)
 
-        # Принудительно показываем ссылку, если это именно запрос на навигацию (открой, перейди)
         if action == "navigate":
             show_link = True
 
@@ -665,7 +681,6 @@ def generate_response(
                 reply = raw_content
 
         if reply:
-            # Отдаем targets только если LLM решила, что ссылку нужно показать
             return {"reply": reply, "targets": targets if show_link else []}
 
     except Exception as e:
@@ -800,6 +815,20 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     enriched_msg = enrich_query_with_history(user_msg, data.history)
     route = route_request(enriched_msg, ontology, bool(data.deadlines))
 
+    # Распознавание запроса на источник (чтобы жестко направить в правильный кусок базы)
+    msg_normalized = normalize_text(user_msg)
+    words = msg_normalized.split()
+    source_request_markers = ["откуда", "где ты", "где нашел", "каком материал", "какой лекции", "где это",
+                              "каком модуле", "источник"]
+    is_source_request = len(words) <= 7 and any(m in msg_normalized for m in source_request_markers)
+
+    if is_source_request:
+        last_target = extract_last_bot_navigation_target(data.history)
+        if last_target:
+            route["query"] = last_target
+            route["action"] = "answer_from_context"
+            route["original_intent"] = "answer_from_context"
+
     debug_context = [
         {"title": "action", "text": route["action"], "score": 0},
         {"title": "router_query (expanded)", "text": route["query"], "score": 0},
@@ -832,7 +861,6 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     elif route["action"] == "navigate":
         execution = exec_navigation(course_modules, data.history)
     else:
-        # ДОСТАЕМ original_intent для правильного поиска (например, про оценки)
         actual_intent = route.get("original_intent", route["action"])
         execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"], intent=actual_intent)
 
