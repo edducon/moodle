@@ -94,7 +94,10 @@ class SemanticRouter:
                 "что дальше", "а дальше", "следующее задание", "следующая тема",
                 "что после этого", "куда идти после лекции", "что после лекции",
                 "следующий шаг", "продолжить курс", "что делать потом",
-                "куда идти после", "что после задания", "открой", "перейди"
+                "куда идти после", "что после задания", "открой", "перейди",
+                "я имел в виду теорию", "хочу начать с теории", "давай теорию",
+                "где лекции", "перейти к лекции", "покажи теорию",
+                "я имел в виду практику", "давай практику", "где задания"
             ],
             "grading": [
                 "как получить оценку", "система оценивания", "критерии оценки",
@@ -359,16 +362,20 @@ def split_text_into_chunks(text: str, chunk_size: int = 450, overlap: int = 150)
 
 def module_kind(title: str, module_type: Optional[str]) -> str:
     t, mt = normalize_text(title), normalize_text(module_type or "")
+
+    # 1. СНАЧАЛА смотрим на название (перехватываем файлы, которые на самом деле являются практикой)
+    if "экзамен" in t or "тест" in t: return "quiz"
+    if "лаборатор" in t or "практическ" in t or "задани" in t or "отчет" in t: return "assignment"
+    if "форум" in t or "обсужд" in t: return "forum"
+    if "лекци" in t or "вводн" in t or "литератур" in t: return "learning"
+
+    # 2. И только если название ни о чем не говорит, доверяем системному типу Moodle
     if mt == "quiz": return "quiz"
     if mt in ("assign", "workshop"): return "assignment"
     if mt == "forum": return "forum"
     if mt in ("page", "book", "file", "folder", "url", "lesson", "resource"): return "learning"
-    if "экзамен" in t or "тест" in t: return "quiz"
-    if "лаборатор" in t or "практическ" in t or "задани" in t: return "assignment"
-    if "форум" in t or "обсужд" in t: return "forum"
-    if "лекци" in t or "вводн" in t or "литератур" in t: return "learning"
-    return "other"
 
+    return "other"
 
 def parse_order_from_title(title: str) -> Tuple[int, int, int]:
     t = normalize_text(title)
@@ -436,29 +443,37 @@ def get_next_module_after(course_modules: List[Dict[str, Any]], current_title: s
     if idx is not None and idx + 1 < len(ordered): return ordered[idx + 1]
     return None
 
-
-def choose_default_start(course_modules: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def choose_default_start(course_modules: List[Dict[str, Any]], skip_org: bool = False) -> Optional[Dict[str, Any]]:
     ordered = order_modules(course_modules)
     if not ordered: return None
+
+    stop_words = ["вводн", "информаци", "описание дисциплин", "план", "литератур", "ресурс", "справочн", "глоссарий",
+                  "пример", "тренировочн", "дополнительн"]
 
     def score(m: Dict[str, Any]) -> Tuple[int, Tuple[int, int, int], int, int]:
         title = normalize_text(m["title"])
         bias = 0
-        if "вводн" in title:
-            bias -= 100
-        elif "описание дисциплины" in title:
-            bias -= 80
-        elif m["kind"] == "learning":
+
+        if skip_org and any(sw in title for sw in stop_words):
+            bias += 1000
+
+        if not skip_org:
+            if "вводн" in title:
+                bias -= 100
+            elif "описание дисциплин" in title or "информаци" in title:
+                bias -= 80
+
+        if m["kind"] == "learning":
             bias -= 30
         elif m["kind"] == "assignment":
             bias -= 10
+
         return (bias, m["order_key"], m["section_index"], m["module_index"])
 
     return sorted(ordered, key=score)[0]
 
-
 def build_course_ontology(course_modules: List[Dict[str, Any]], deadlines: List[DeadlineItem], course_title: str) -> \
-        Dict[str, Any]:
+Dict[str, Any]:
     ordered = order_modules(course_modules)
     return {
         "course_title": course_title,
@@ -468,10 +483,10 @@ def build_course_ontology(course_modules: List[Dict[str, Any]], deadlines: List[
             "quizzes": len([m for m in ordered if m["kind"] == "quiz"]),
             "forums": len([m for m in ordered if m["kind"] == "forum"]),
         },
-        "start_module": choose_default_start(course_modules),
+        # Для обзора курса оставляем базовое поведение (с вводными материалами)
+        "start_module": choose_default_start(course_modules, skip_org=False),
         "deadlines": deadlines,
     }
-
 
 # =========================
 # ROUTING & RETRIEVAL
@@ -484,34 +499,30 @@ def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bo
     whitelist_markers = [
         "дедлайн", "лекци", "задани", "тест", "оценк", "препод", "начать",
         "экзамен", "автомат", "зачет", "сдавать", "баллы", "правил", "курс", "срок",
-        "лаб", "практическ", "сколько", "структур", "условия", "дальше", "следующ", "преподавател"
+        "лаб", "практическ", "сколько", "структур", "условия", "дальше", "следующ", "преподавател",
+        "теори", "материал"
     ]
     if len(words) <= 2 and not any(marker in msg_normalized for marker in whitelist_markers):
         return {"action": "smalltalk", "scope": "generic", "query": enriched_msg, "original_intent": "smalltalk"}
 
-    # 1. Жесткий перехват для преподавателя
     teacher_keywords = ["препод", "преподавател", "лектор", "ведет курс", "кто читает"]
     if any(kw in msg_normalized for kw in teacher_keywords):
         return {"action": "teacher_info", "scope": "generic", "query": enriched_msg, "original_intent": "teacher_info"}
 
-    # 2. Роутер
     intent, search_query = semantic_router.classify(enriched_msg, threshold=0.60)
 
-    # 3. Защита от "галлюцинаций" роутера
     grading_keywords = ["оценк", "сда", "балл", "зачет", "экзамен", "автомат", "дедлайн", "система", "критерии"]
 
-    # Если роутер решил, что это grading, но в запросе НЕТ слов-маркеров, это ложное срабатывание (например, "тестирование")
     is_false_positive = (intent in ["grading", "find_deadline"]) and not any(
         kw in msg_normalized for kw in grading_keywords)
 
-    # Если запрос до 6 слов и нет маркеров оценок, считаем его поиском термина ("что такое нагрузочное тестирование")
-    is_term_query = len(words) <= 6 and not any(kw in msg_normalized for kw in grading_keywords)
+    # ИСПРАВЛЕНО: Теперь короткие запросы не ломают навигацию и обзор курса
+    is_term_query = len(words) <= 6 and intent not in ["navigate", "smalltalk", "teacher_info", "course_overview", "find_deadline"] and not any(kw in msg_normalized for kw in grading_keywords)
 
     if is_false_positive or is_term_query:
         intent = "answer_from_context"
         search_query = enriched_msg
 
-    # Сохраняем оригинальный интент, чтобы не потерять логику (например, для grading)
     route = {"action": intent, "scope": "generic", "query": search_query, "original_intent": intent}
 
     if intent == "find_deadline" and not has_deadlines:
@@ -550,15 +561,41 @@ def retrieve_candidates(db: Session, course_id: str, viewer_role: str, search_qu
 # EXECUTORS
 # =========================
 
-def exec_navigation(course_modules: List[Dict[str, Any]], history: List[ChatHistoryItem]) -> Dict[str, Any]:
+def exec_navigation(course_modules: List[Dict[str, Any]], history: List[ChatHistoryItem], query: str = "") -> Dict[str, Any]:
     last_target = extract_last_bot_navigation_target(history)
-    if last_target:
-        nxt = get_next_module_after(course_modules, last_target)
-        if nxt: return {"facts": {"mode": "next_step", "current_target": last_target, "next_module": nxt},
-                        "targets": [nxt]}
-    start = choose_default_start(course_modules)
-    return {"facts": {"mode": "start", "start_module": start}, "targets": [start] if start else []}
+    query_lower = normalize_text(query)
 
+    def clean_mod(m: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not m: return None
+        c = m.copy()
+        c.pop("url", None)
+        return c
+
+    is_next = any(w in query_lower for w in ["дальше", "потом", "следующ", "после"])
+    if is_next and last_target:
+        nxt = get_next_module_after(course_modules, last_target)
+        if nxt: return {"facts": {"mode": "next_step", "current_target": last_target, "next_module": clean_mod(nxt)},
+                        "targets": [nxt]}
+
+    stop_words = ["вводн", "информаци", "план", "литератур", "ресурс", "справочн", "глоссарий", "пример", "зачет", "тренировочн", "дополнительн"]
+
+    if any(w in query_lower for w in ["задани", "лаб", "практик", "тест"]):
+        assigns = [m for m in order_modules(course_modules) if m["kind"] in ("assignment", "quiz") and not any(sw in normalize_text(m["title"]) for sw in stop_words)]
+        if not assigns:
+            assigns = [m for m in order_modules(course_modules) if m["kind"] in ("assignment", "quiz")]
+        start = assigns[0] if assigns else choose_default_start(course_modules, skip_org=True)
+
+    elif any(w in query_lower for w in ["теори", "лекци", "учебник", "читать", "материал"]):
+        learning = [m for m in order_modules(course_modules) if m["kind"] == "learning"]
+        real_theory = [m for m in learning if not any(sw in normalize_text(m["title"]) for sw in stop_words)]
+        if not real_theory:
+            real_theory = learning
+        start = real_theory[0] if real_theory else choose_default_start(course_modules, skip_org=True)
+
+    else:
+        start = choose_default_start(course_modules, skip_org=False)
+
+    return {"facts": {"mode": "start", "start_module": clean_mod(start)}, "targets": [start] if start else []}
 
 def exec_course_overview(ontology: Dict[str, Any], course_modules: List[Dict[str, Any]]) -> Dict[str, Any]:
     ordered = order_modules(course_modules)
@@ -566,10 +603,15 @@ def exec_course_overview(ontology: Dict[str, Any], course_modules: List[Dict[str
     assignment_titles = [m["title"] for m in ordered if m["kind"] == "assignment"][:10]
     quiz_titles = [m["title"] for m in ordered if m["kind"] == "quiz"][:10]
 
+    start_mod = ontology.get("start_module")
+    if start_mod:
+        start_mod = start_mod.copy()
+        start_mod.pop("url", None)
+
     return {"facts": {
         "course_title": ontology.get("course_title", ""),
         "counts": ontology.get("counts", {}),
-        "start_module": ontology.get("start_module"),
+        "start_module": start_mod, # Отдаем безопасную копию без URL
         "learning_modules": learning_titles,
         "assignment_modules": assignment_titles,
         "quiz_modules": quiz_titles,
@@ -587,15 +629,12 @@ def exec_deadlines(deadlines: List[DeadlineItem], scope: str) -> Dict[str, Any]:
     return {"facts": {"has_deadlines": True, "deadlines": deadlines[:10], "scope": scope}, "targets": []}
 
 
-def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str, intent: str = "") -> Dict[
-    str, Any]:
+def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str, intent: str = "") -> Dict[str, Any]:
     candidates, score_map = retrieve_candidates(db=db, course_id=course_id, viewer_role=viewer_role, search_query=query)
 
-    # Принудительно подтягиваем модули с правилами оценок, если оригинальный интент grading
     if intent == "grading":
         grading_keywords = ["оценк", "система оценки", "оценивани", "рейтинг", "баллы", "критерии"]
-        grading_candidates = [c for c in candidates if
-                              any(kw in normalize_text(c.get("title", "")) for kw in grading_keywords)]
+        grading_candidates = [c for c in candidates if any(kw in normalize_text(c.get("title", "")) for kw in grading_keywords)]
         other_candidates = [c for c in candidates if c not in grading_candidates]
         candidates = grading_candidates + other_candidates
 
@@ -603,7 +642,13 @@ def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, quer
         snippet_raw = c.get("content_text", "")[:80].strip()
         c["snippet"] = re.sub(r'\s+', ' ', snippet_raw)
 
-    return {"facts": {"query": query, "candidates": candidates[:5]}, "targets": candidates[:1], "score_map": score_map}
+    facts_candidates = []
+    for c in candidates[:5]:
+        c_copy = c.copy()
+        c_copy.pop("url", None)
+        facts_candidates.append(c_copy)
+
+    return {"facts": {"query": query, "candidates": facts_candidates}, "targets": candidates[:1], "score_map": score_map}
 
 
 # =========================
@@ -644,7 +689,8 @@ def generate_response(
 Устанавливай "show_link": true ТОЛЬКО в следующих случаях:
 1. Студент ЯВНО просит показать источник или ссылку (например: "где это", "откуда инфа", "дай ссылку", "покажи").
 2. Студент просит навигацию ("перейди к лекции", "открой задание").
-Если студент спрашивает "где ты это нашел?", ответь: "Эта информация находится в материале: [Название]" и обязательно поставь "show_link": true.
+
+ВАЖНО: Сами URL-адреса скрыты из твоих фактов, но система АВТОМАТИЧЕСКИ добавит нужную кнопку, если ты вернешь "show_link": true. Поэтому НИКОГДА не говори студенту "я не нашел ссылку" или "у меня нет ссылки". Просто ответь "Вот материал, о котором идет речь:" и обязательно установи "show_link": true.
 
 Верни СТРОГО JSON:
 {{
@@ -859,7 +905,7 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     elif route["action"] == "course_overview":
         execution = exec_course_overview(ontology, course_modules)
     elif route["action"] == "navigate":
-        execution = exec_navigation(course_modules, data.history)
+        execution = exec_navigation(course_modules, data.history, route["query"])
     else:
         actual_intent = route.get("original_intent", route["action"])
         execution = exec_answer_from_context(db, data.course_id, viewer_role, route["query"], intent=actual_intent)
