@@ -303,62 +303,86 @@ def course_module_visible_for_role(module_data: Dict[str, Any], viewer_role: Opt
     if visibility.get("is_hidden", False) or visibility.get("has_restrictions", False): return False
     return True
 
-
-def split_text_into_chunks(text: str, chunk_size: int = 450, overlap: int = 150) -> List[str]:
+def split_text_into_chunks(text: str, max_chunk_size: int = 1200) -> List[str]:
     if not text: return []
+
+    # 1. Очистка системного мусора
     text = re.sub(r"Печатать книгу.*?Оглавление", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"Просмотр всех ответов[\s\S]*?(?=МЕТАДАННЫЕ|$)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b\d{3}-\d{3,4}\b\s*", "", text)
 
-    paragraphs = re.split(r"\n+", text.strip())
+    metadata_block = ""
+    meta_marker = "МЕТАДАННЫЕ ЭЛЕМЕНТА:"
+    if meta_marker in text:
+        parts = text.split(meta_marker)
+        text = parts[0]
+        metadata_block = meta_marker + parts[1]
+
+    # 2. Если фронтенд вдруг прислал HTML - делаем из тегов настоящие переносы
+    if bool(re.search(r'</?(p|div|br|li|h[1-6]|table|tr|td)[^>]*>', text, re.IGNORECASE)):
+        text = re.sub(r'<(p|div|br|li|h[1-6]|tr|table|ul|ol)[^>]*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</(p|div|li|h[1-6]|tr|table|ul|ol)>', '\n', text, flags=re.IGNORECASE)
+        soup = BeautifulSoup(text, "html.parser")
+        text = soup.get_text(separator=" ")
+
+    # 3. Спасаем слипшийся текст (если фронтенд прислал сплошную строку)
+    # Если после точки нет пробела: "заказчика.Дефект" -> "заказчика. Дефект"
+    text = re.sub(r'([a-zа-яё])([.!?])([A-ZА-ЯЁ])', r'\1\2 \3', text)
+    # Если слова слиплись регистрами: "обоснованиеЦель" -> "обоснование Цель"
+    text = re.sub(r'([a-zа-яё])([A-ZА-ЯЁ])', r'\1 \2', text)
+
+    # ГЛАВНАЯ МАГИЯ: Разрываем слипшиеся определения на отдельные абзацы
+    # Ищет: Знак препинания -> Большое слово со скобками -> тире. И ставит перед ним \n
+    text = re.sub(r'([.!?|)])\s*([А-ЯЁ][а-яёa-zA-Z\s,()]+[-–—−]\s)', r'\1\n\2', text)
+
+    # Убираем лишние пробелы и пустые строки
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n\s+', '\n', text)
+    text = re.sub(r'\n+', '\n', text)
+
+    paragraphs = text.strip().split('\n')
     chunks = []
-    current_chunk = ""
 
     for p in paragraphs:
         p = p.strip()
-        if not p or len(p) < 10:
+        if len(p) < 15:
             continue
 
-        if len(current_chunk) + len(p) + 1 <= chunk_size:
-            current_chunk += ("\n" + p if current_chunk else p)
+        if len(p) <= max_chunk_size:
+            chunks.append(p)
         else:
+            sentences = re.split(r'(?<=[.!?])\s+', p)
+            current_chunk = ""
+
+            for sentence in sentences:
+                if len(sentence) > max_chunk_size:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = ""
+
+                    words = sentence.split()
+                    for word in words:
+                        if len(current_chunk) + len(word) < max_chunk_size:
+                            current_chunk += word + " "
+                        else:
+                            chunks.append(current_chunk.strip())
+                            current_chunk = word + " "
+                    continue
+
+                if len(current_chunk) + len(sentence) <= max_chunk_size:
+                    current_chunk += sentence + " "
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = sentence + " "
+
             if current_chunk:
                 chunks.append(current_chunk.strip())
-                overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-                space_idx = overlap_text.find(' ')
-                if space_idx != -1:
-                    overlap_text = overlap_text[space_idx + 1:]
-                current_chunk = overlap_text + "\n"
-            else:
-                current_chunk = ""
 
-            while len(p) > chunk_size:
-                cut_idx = p.rfind(' ', 0, chunk_size)
-                if cut_idx == -1:
-                    cut_idx = chunk_size
-
-                part = current_chunk + p[:cut_idx]
-                chunks.append(part.strip())
-                current_chunk = ""
-
-                overlap_start = max(0, cut_idx - overlap)
-                space_overlap = p.find(' ', overlap_start)
-
-                if space_overlap != -1 and space_overlap < cut_idx:
-                    p = p[space_overlap + 1:]
-                else:
-                    p = p[overlap_start:]
-
-            if len(p.strip()) >= 10:
-                current_chunk += p
-            else:
-                current_chunk = ""
-
-    if len(current_chunk.strip()) >= 10:
-        chunks.append(current_chunk.strip())
+    if metadata_block:
+        chunks.append(metadata_block.strip())
 
     return chunks
-
 
 def module_kind(title: str, module_type: Optional[str]) -> str:
     t, mt = normalize_text(title), normalize_text(module_type or "")
@@ -629,12 +653,14 @@ def exec_deadlines(deadlines: List[DeadlineItem], scope: str) -> Dict[str, Any]:
     return {"facts": {"has_deadlines": True, "deadlines": deadlines[:10], "scope": scope}, "targets": []}
 
 
-def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str, intent: str = "") -> Dict[str, Any]:
+def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, query: str, intent: str = "") -> Dict[
+    str, Any]:
     candidates, score_map = retrieve_candidates(db=db, course_id=course_id, viewer_role=viewer_role, search_query=query)
 
     if intent == "grading":
         grading_keywords = ["оценк", "система оценки", "оценивани", "рейтинг", "баллы", "критерии"]
-        grading_candidates = [c for c in candidates if any(kw in normalize_text(c.get("title", "")) for kw in grading_keywords)]
+        grading_candidates = [c for c in candidates if
+                              any(kw in normalize_text(c.get("title", "")) for kw in grading_keywords)]
         other_candidates = [c for c in candidates if c not in grading_candidates]
         candidates = grading_candidates + other_candidates
 
@@ -648,7 +674,9 @@ def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, quer
         c_copy.pop("url", None)
         facts_candidates.append(c_copy)
 
-    return {"facts": {"query": query, "candidates": facts_candidates}, "targets": candidates[:1], "score_map": score_map}
+    # ИЗМЕНЕНИЕ: Теперь мы передаем в targets все топ-5 материалов (с их URL), а не только первый [:1]
+    return {"facts": {"query": query, "candidates": facts_candidates}, "targets": candidates[:5],
+            "score_map": score_map}
 
 
 # =========================
@@ -663,39 +691,34 @@ def generate_response(
         ontology: Dict[str, Any]
 ) -> Dict[str, Any]:
     facts = execution.get("facts", {})
-    targets = [t for t in execution.get("targets", []) if t]
+    all_targets = [t for t in execution.get("targets", []) if t]
 
     prompt = f"""
 Ты интеллектуальный помощник для студентов курса в Moodle.
-Отвечай вежливо, естественно и кратко (максимум 3-4 предложения).
-Используй ТОЛЬКО переданные факты, ничего не придумывай.
-Ни в коем случае не выдумывай правила прохождения тестов или экзаменов (про время, падежи ответов, попытки и т.д.), если этого нет в фактах.
-Никогда не используй фразы "прошу прощения", "по умолчанию", "как правило", "из предоставленной информации неясно".
-Никогда не вставляй URL-ссылки прямо в текст ответа — студент сам нажмет на кнопку перехода под твоим сообщением.
+Твой стиль общения: уверенный, прямой, профессиональный. Отвечай вежливо, но без извинений и лишних вводных слов. Максимум 3-4 предложения.
+ОТВЕЧАЙ СТРОГО НА ОСНОВЕ ПЕРЕДАННЫХ ФАКТОВ. Ничего не придумывай.
 
-Словарь студенческого сленга для понимания запросов:
-- "автомат" = автоматическая оценка без экзамена по результатам семестра
-- "хвост" = несданный экзамен или задолженность
-- "пересдача" = повторная сдача экзамена или теста
-- "лаба" = лабораторная работа
-- "зачетка" = зачетная книжка
+ПРАВИЛА БЕЗОПАСНОСТИ:
+1. Запрещено придумывать правила сдачи, дедлайны.
+2. Запрещено соглашаться с догадками студента.
+3. Если информации нет: "В материалах курса нет точной информации..."
+4. Запрещены: "К сожалению", "Извините", "Прошу прощения", "Исходя из контекста".
 
-Если в фактах недостаточно информации для точного ответа на вопрос об образовательном процессе — честно скажи, что не знаешь, и порекомендуй обратиться к преподавателю. Не угадывай!
-Если студент спрашивает определение термина — приведи его ПОЛНОСТЬЮ из фактов.
-Если в фактах написано, что преподаватель не указан — так и скажи, не придумывай. Но если преподаватель передан в фактах, назови его.
+ПРАВИЛА УПРАВЛЕНИЯ ИНТЕРФЕЙСОМ (show_link):
+Ты управляешь появлением кнопки-ссылки.
+"show_link": false - по умолчанию.
+"show_link": true - ОБЯЗАТЕЛЬНО используй, если:
+  - Студент просит ссылку ("где это?").
+  - Студент просит перейти к материалу.
+  - Студент спрашивает определение термина ("Что такое...", "Кто такой..."). В этом случае всегда давай источник!
 
-ВАЖНОЕ ПРАВИЛО ПРО КНОПКИ-ПЕРЕХОДЫ (show_link):
-По умолчанию студент НЕ хочет видеть кнопку-ссылку на материал, она загромождает чат (ставь "show_link": false).
-Устанавливай "show_link": true ТОЛЬКО в следующих случаях:
-1. Студент ЯВНО просит показать источник или ссылку (например: "где это", "откуда инфа", "дай ссылку", "покажи").
-2. Студент просит навигацию ("перейди к лекции", "открой задание").
-
-ВАЖНО: Сами URL-адреса скрыты из твоих фактов, но система АВТОМАТИЧЕСКИ добавит нужную кнопку, если ты вернешь "show_link": true. Поэтому НИКОГДА не говори студенту "я не нашел ссылку" или "у меня нет ссылки". Просто ответь "Вот материал, о котором идет речь:" и обязательно установи "show_link": true.
-
-Верни СТРОГО JSON:
+Верни СТРОГО валидный JSON:
 {{
-  "reply": "твой ответ студенту",
-  "show_link": false
+  "_thought": "Рассуждай: это запрос термина? Если да, я обязан дать ссылку. Укажи ID.",
+  "exact_quote": "Точная цитата из текста",
+  "reply": "Твой ответ",
+  "show_link": true,
+  "source_id": "ID материала"
 }}
 
 --- КОНТЕКСТ ---
@@ -717,17 +740,32 @@ def generate_response(
         raw_content = resp.choices[0].message.content.strip()
         data = extract_json_from_text(raw_content)
         reply = safe_strip(data.get("reply", ""))
-        show_link = data.get("show_link", False)
 
-        if action == "navigate":
+        show_link_val = data.get("show_link", False)
+        show_link = str(show_link_val).lower() == "true" if isinstance(show_link_val, str) else bool(show_link_val)
+
+        source_id = data.get("source_id")
+        exact_quote = data.get("exact_quote")
+
+        final_targets = []
+        if action == "navigate" or action == "course_overview":
             show_link = True
+            final_targets = all_targets
+        elif show_link:
+            if source_id:
+                final_targets = [t for t in all_targets if str(t.get("id")) == str(source_id)]
+            if not final_targets and all_targets:
+                final_targets = [all_targets[0]]
+
+            if exact_quote and final_targets:
+                final_targets[0]["snippet"] = exact_quote
 
         if not reply and raw_content:
             if not raw_content.startswith("{"):
                 reply = raw_content
 
         if reply:
-            return {"reply": reply, "targets": targets if show_link else []}
+            return {"reply": reply, "targets": final_targets if show_link else []}
 
     except Exception as e:
         print(f"Ошибка LLM-генерации: {e}")
@@ -735,16 +773,33 @@ def generate_response(
             raw = resp.choices[0].message.content.strip()
             recovered = extract_json_from_text(raw)
             if recovered and recovered.get("reply"):
-                show_link = recovered.get("show_link", False)
-                if action == "navigate": show_link = True
-                return {"reply": recovered["reply"], "targets": targets if show_link else []}
+                show_link_val = recovered.get("show_link", False)
+                show_link = str(show_link_val).lower() == "true" if isinstance(show_link_val, str) else bool(
+                    show_link_val)
+
+                source_id = recovered.get("source_id")
+                exact_quote = recovered.get("exact_quote")
+
+                final_targets = []
+                if action == "navigate" or action == "course_overview":
+                    show_link = True
+                    final_targets = all_targets
+                elif show_link:
+                    if source_id:
+                        final_targets = [t for t in all_targets if str(t.get("id")) == str(source_id)]
+                    if not final_targets and all_targets:
+                        final_targets = [all_targets[0]]
+
+                    if exact_quote and final_targets:
+                        final_targets[0]["snippet"] = exact_quote
+
+                return {"reply": recovered["reply"], "targets": final_targets if show_link else []}
             if not raw.startswith("{"):
-                return {"reply": raw, "targets": targets}
+                return {"reply": raw, "targets": all_targets[:1]}
 
     return {
         "reply": "Произошла техническая ошибка при формулировании ответа. Пожалуйста, попробуйте спросить чуть иначе.",
-        "targets": targets}
-
+        "targets": all_targets[:1]}
 
 # =========================
 # ENDPOINTS
@@ -865,7 +920,7 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     msg_normalized = normalize_text(user_msg)
     words = msg_normalized.split()
     source_request_markers = ["откуда", "где ты", "где нашел", "каком материал", "какой лекции", "где это",
-                              "каком модуле", "источник"]
+                              "каком модуле", "источник", "ссылку", "ссылка"]
     is_source_request = len(words) <= 7 and any(m in msg_normalized for m in source_request_markers)
 
     if is_source_request:
