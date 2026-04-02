@@ -1,4 +1,3 @@
-# Берем полноценный, стабильный Python 3.11
 FROM python:3.14-slim
 
 WORKDIR /app

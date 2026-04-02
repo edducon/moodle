@@ -31,7 +31,6 @@ services:
     environment:
       # Динамически собираем ссылку для SQLAlchemy внутри контейнера
       DATABASE_URL: postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@moodle_db:5432/${DB_NAME}
-      # Спец-адрес Docker для доступа к Ollama на твоем ПК
       OLLAMA_URL: http://host.docker.internal:11434/v1
     restart: unless-stopped
 

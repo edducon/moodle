@@ -8,7 +8,6 @@ function spinCircle() {
     logo.classList.add('spin-once');
 }
 
-// === ФУНКЦИИ ДЛЯ ДЕДЛАЙНОВ ===
 function getDaysLeft(date) {
     if (!date) return 0;
     const today = new Date(new Date().setHours(0, 0, 0, 0));
@@ -28,7 +27,6 @@ async function extractDeadlinesFromCourse() {
     const assignments = [];
     const seenAssigns = new Set();
 
-    // 1. Быстро собираем все ссылки на задания
     for (const doc of doms) {
         const assigns = doc.querySelectorAll('li.activity.modtype_assign');
         for (const act of assigns) {
@@ -41,7 +39,6 @@ async function extractDeadlinesFromCourse() {
 
     const deadlines = [];
 
-    // 2. Асинхронно скачиваем страницы пачками по 4 штуки
     for (let i = 0; i < assignments.length; i += 4) {
         const chunk = assignments.slice(i, i + 4);
         const promises = chunk.map(async (assign) => {
@@ -251,8 +248,6 @@ function toggleDeadlinesVisibility(isChatOpen) {
     }
 }
 
-// === НОВЫЕ ФУНКЦИИ ДЛЯ КОНТЕКСТА ===
-
 function trimLongText(text, maxLen = 120000) {
     const value = (text || '').trim();
     if (value.length <= maxLen) return value;
@@ -412,8 +407,6 @@ function getAssignStatusText() {
         return '';
     }
 }
-
-// === ФУНКЦИИ ИНТЕРФЕЙСА ЧАТА ===
 
 function highlightElement(targetId) {
     const el = document.getElementById(targetId);
@@ -807,7 +800,6 @@ async function getUngradedAssignments() {
     return ungradedList.sort((a, b) => b.count - a.count);
 }
 
-// === ТОЧКА ВХОДА ===
 setTimeout(async () => {
     injectChatUI();
 
@@ -843,7 +835,6 @@ setTimeout(async () => {
                 if (!localStorage.getItem(onboardingKey)) {
                     let quizCount = 0; let assignCount = 0;
                     const doms = await getCourseDOMs();
-                    // Считаем только реально доступные элементы (не скрытые И не ограниченные)
                     const isAvailable = (el) => !isActivityHidden(el) && !hasRestrictionMarkers(el);
                     doms.forEach(doc => {
                         quizCount += Array.from(doc.querySelectorAll('li.activity.modtype_quiz')).filter(isAvailable).length;
@@ -969,7 +960,6 @@ setTimeout(async () => {
             const teacherKey = `moodle_bot_teacher_notified_${courseId}`;
             const today = new Date().toLocaleDateString('ru-RU');
 
-            // Тихо парсим дедлайны для преподавателя тоже (для чата, без виджета)
             const deadlinesCacheKey = `moodle_bot_teacher_deadlines_cache_${courseId}`;
             const deadlinesCacheTimeKey = `moodle_bot_teacher_deadlines_time_${courseId}`;
             const now = new Date().getTime();
@@ -1025,9 +1015,6 @@ setTimeout(async () => {
             };
 
             fetchTeacherData();
-
-            // Проверяем логи курса на наличие обновлений (доступно только преподавателям)
-            // Если препод что-то изменил — автоматически перезапускаем индексацию
             checkMoodleLogForUpdates();
 
             document.addEventListener('click', (e) => {

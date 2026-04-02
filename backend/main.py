@@ -1,7 +1,6 @@
 import re
 import json
 import copy
-import os
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -11,13 +10,12 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 from config import settings
-from database import SessionLocal, Course, ModuleIndex, ChatLog, CourseParticipant
+from database import SessionLocal, Course, ModuleIndex, ChatLog, CourseParticipant, CourseDeadline
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Moodle Assistant API")
@@ -40,11 +38,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-
-# =========================
-# BASE TEXT HELPERS
-# =========================
 
 def normalize_text(text: str) -> str:
     text = (text or "").lower().strip()
@@ -71,11 +64,6 @@ def extract_json_from_text(text: str) -> dict:
     except:
         pass
     return {}
-
-
-# =========================
-# SEMANTIC ROUTER
-# =========================
 
 class SemanticRouter:
     def __init__(self, embedder):
@@ -176,11 +164,6 @@ class SemanticRouter:
 
 semantic_router = SemanticRouter(embedder)
 
-
-# =========================
-# SCHEMAS
-# =========================
-
 class CourseData(BaseModel):
     course_id: str
     title: str
@@ -241,11 +224,6 @@ class FeedbackRequest(BaseModel):
     log_id: int
     is_helpful: int
 
-
-# =========================
-# MOODLE & DOMAIN HELPERS
-# =========================
-
 ANAPHORA_MARKERS = [
     "а дальше", "что потом", "после этого", "а после",
     "ее", "её", "его", "их", "это", "эту", "этот", "этом", "там",
@@ -261,7 +239,8 @@ SELF_CONTAINED_MARKERS = [
 
 ERROR_MARKERS = [
     "техническая ошибка", "пожалуйста, попробуйте", "произошла ошибка",
-    "не проиндексирован", "не найден", "попробуйте спросить"
+    "не проиндексирован", "не найден", "попробуйте спросить",
+    "в материалах курса нет"
 ]
 
 
@@ -306,7 +285,6 @@ def course_module_visible_for_role(module_data: Dict[str, Any], viewer_role: Opt
 def split_text_into_chunks(text: str, max_chunk_size: int = 1200) -> List[str]:
     if not text: return []
 
-    # 1. Очистка системного мусора
     text = re.sub(r"Печатать книгу.*?Оглавление", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"Просмотр всех ответов[\s\S]*?(?=МЕТАДАННЫЕ|$)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b\d{3}-\d{3,4}\b\s*", "", text)
@@ -318,24 +296,16 @@ def split_text_into_chunks(text: str, max_chunk_size: int = 1200) -> List[str]:
         text = parts[0]
         metadata_block = meta_marker + parts[1]
 
-    # 2. Если фронтенд вдруг прислал HTML - делаем из тегов настоящие переносы
     if bool(re.search(r'</?(p|div|br|li|h[1-6]|table|tr|td)[^>]*>', text, re.IGNORECASE)):
         text = re.sub(r'<(p|div|br|li|h[1-6]|tr|table|ul|ol)[^>]*>', '\n', text, flags=re.IGNORECASE)
         text = re.sub(r'</(p|div|li|h[1-6]|tr|table|ul|ol)>', '\n', text, flags=re.IGNORECASE)
         soup = BeautifulSoup(text, "html.parser")
         text = soup.get_text(separator=" ")
 
-    # 3. Спасаем слипшийся текст (если фронтенд прислал сплошную строку)
-    # Если после точки нет пробела: "заказчика.Дефект" -> "заказчика. Дефект"
     text = re.sub(r'([a-zа-яё])([.!?])([A-ZА-ЯЁ])', r'\1\2 \3', text)
-    # Если слова слиплись регистрами: "обоснованиеЦель" -> "обоснование Цель"
     text = re.sub(r'([a-zа-яё])([A-ZА-ЯЁ])', r'\1 \2', text)
-
-    # ГЛАВНАЯ МАГИЯ: Разрываем слипшиеся определения на отдельные абзацы
-    # Ищет: Знак препинания -> Большое слово со скобками -> тире. И ставит перед ним \n
     text = re.sub(r'([.!?|)])\s*([А-ЯЁ][а-яёa-zA-Z\s,()]+[-–—−]\s)', r'\1\n\2', text)
 
-    # Убираем лишние пробелы и пустые строки
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n\s+', '\n', text)
     text = re.sub(r'\n+', '\n', text)
@@ -387,13 +357,11 @@ def split_text_into_chunks(text: str, max_chunk_size: int = 1200) -> List[str]:
 def module_kind(title: str, module_type: Optional[str]) -> str:
     t, mt = normalize_text(title), normalize_text(module_type or "")
 
-    # 1. СНАЧАЛА смотрим на название (перехватываем файлы, которые на самом деле являются практикой)
     if "экзамен" in t or "тест" in t: return "quiz"
     if "лаборатор" in t or "практическ" in t or "задани" in t or "отчет" in t: return "assignment"
     if "форум" in t or "обсужд" in t: return "forum"
     if "лекци" in t or "вводн" in t or "литератур" in t: return "learning"
 
-    # 2. И только если название ни о чем не говорит, доверяем системному типу Moodle
     if mt == "quiz": return "quiz"
     if mt in ("assign", "workshop"): return "assignment"
     if mt == "forum": return "forum"
@@ -442,7 +410,6 @@ def extract_last_bot_navigation_target(history: List[ChatHistoryItem]) -> str:
         if item.role != "assistant": continue
         text = item.content or ""
 
-        # Ищем явные переходы
         m = re.search(r'(?:Переход|Источник):\s*(.+)', text, flags=re.IGNORECASE)
         if m: return m.group(1).strip()
 
@@ -497,7 +464,7 @@ def choose_default_start(course_modules: List[Dict[str, Any]], skip_org: bool = 
     return sorted(ordered, key=score)[0]
 
 def build_course_ontology(course_modules: List[Dict[str, Any]], deadlines: List[DeadlineItem], course_title: str) -> \
-Dict[str, Any]:
+        Dict[str, Any]:
     ordered = order_modules(course_modules)
     return {
         "course_title": course_title,
@@ -507,14 +474,9 @@ Dict[str, Any]:
             "quizzes": len([m for m in ordered if m["kind"] == "quiz"]),
             "forums": len([m for m in ordered if m["kind"] == "forum"]),
         },
-        # Для обзора курса оставляем базовое поведение (с вводными материалами)
         "start_module": choose_default_start(course_modules, skip_org=False),
         "deadlines": deadlines,
     }
-
-# =========================
-# ROUTING & RETRIEVAL
-# =========================
 
 def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bool) -> Dict[str, Any]:
     msg_normalized = normalize_text(enriched_msg)
@@ -524,7 +486,7 @@ def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bo
         "дедлайн", "лекци", "задани", "тест", "оценк", "препод", "начать",
         "экзамен", "автомат", "зачет", "сдавать", "баллы", "правил", "курс", "срок",
         "лаб", "практическ", "сколько", "структур", "условия", "дальше", "следующ", "преподавател",
-        "теори", "материал"
+        "теори", "материал", "потом", "после"
     ]
     if len(words) <= 2 and not any(marker in msg_normalized for marker in whitelist_markers):
         return {"action": "smalltalk", "scope": "generic", "query": enriched_msg, "original_intent": "smalltalk"}
@@ -540,8 +502,9 @@ def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bo
     is_false_positive = (intent in ["grading", "find_deadline"]) and not any(
         kw in msg_normalized for kw in grading_keywords)
 
-    # ИСПРАВЛЕНО: Теперь короткие запросы не ломают навигацию и обзор курса
-    is_term_query = len(words) <= 6 and intent not in ["navigate", "smalltalk", "teacher_info", "course_overview", "find_deadline"] and not any(kw in msg_normalized for kw in grading_keywords)
+    is_term_query = len(words) <= 6 and intent not in ["navigate", "smalltalk", "teacher_info", "course_overview",
+                                                       "find_deadline"] and not any(
+        kw in msg_normalized for kw in grading_keywords)
 
     if is_false_positive or is_term_query:
         intent = "answer_from_context"
@@ -549,9 +512,7 @@ def route_request(enriched_msg: str, ontology: Dict[str, Any], has_deadlines: bo
 
     route = {"action": intent, "scope": "generic", "query": search_query, "original_intent": intent}
 
-    if intent == "find_deadline" and not has_deadlines:
-        route["action"] = "answer_from_context"
-    elif intent == "grading":
+    if intent == "grading":
         route["action"] = "answer_from_context"
 
     return route
@@ -564,12 +525,29 @@ def retrieve_candidates(db: Session, course_id: str, viewer_role: str, search_qu
 
     raw_results = db.query(ModuleIndex, distance_col.label("distance")).filter(
         ModuleIndex.course_id == course_id
-    ).order_by(distance_col).limit(15).all()
+    ).order_by(distance_col).limit(20).all()
+
+    query_normalized = normalize_text(search_query)
+    stop_words = {"такое", "какой", "какая", "какие", "этот", "этого", "через",
+                  "можно", "нужно", "будет", "может", "когда", "после", "перед",
+                  "между", "около", "более", "менее", "очень", "также", "только",
+                  "получить", "знать", "хочу", "курсу", "делать", "какую"}
+    query_keywords = [w for w in query_normalized.split() if len(w) > 3 and w not in stop_words]
 
     scored = []
     for c, dist in raw_results:
         if not db_module_visible_for_role(c, viewer_role): continue
-        scored.append((dist, {
+
+        content_normalized = normalize_text(c.content_text or "")
+        keyword_boost = 0.0
+        for kw in query_keywords:
+            if kw in content_normalized:
+                keyword_boost += 0.06
+
+        keyword_boost = min(keyword_boost, 0.15)
+        adjusted_dist = max(0.01, dist - keyword_boost)
+
+        scored.append((adjusted_dist, {
             "id": str(c.id), "moodle_id": c.moodle_id, "url": c.url,
             "title": c.title, "kind": module_kind(c.title or "", c.module_type),
             "content_text": c.content_text, "module_type": c.module_type,
@@ -580,12 +558,8 @@ def retrieve_candidates(db: Session, course_id: str, viewer_role: str, search_qu
     score_map = {item["id"]: round(score, 4) for score, item in scored[:15]}
     return candidates, score_map
 
-
-# =========================
-# EXECUTORS
-# =========================
-
-def exec_navigation(course_modules: List[Dict[str, Any]], history: List[ChatHistoryItem], query: str = "") -> Dict[str, Any]:
+def exec_navigation(course_modules: List[Dict[str, Any]], history: List[ChatHistoryItem], query: str = "") -> Dict[
+    str, Any]:
     last_target = extract_last_bot_navigation_target(history)
     query_lower = normalize_text(query)
 
@@ -601,13 +575,20 @@ def exec_navigation(course_modules: List[Dict[str, Any]], history: List[ChatHist
         if nxt: return {"facts": {"mode": "next_step", "current_target": last_target, "next_module": clean_mod(nxt)},
                         "targets": [nxt]}
 
-    stop_words = ["вводн", "информаци", "план", "литератур", "ресурс", "справочн", "глоссарий", "пример", "зачет", "тренировочн", "дополнительн"]
+    stop_words = ["вводн", "информаци", "план", "литератур", "ресурс", "справочн", "глоссарий", "пример", "зачет",
+                  "тренировочн", "дополнительн"]
 
-    if any(w in query_lower for w in ["задани", "лаб", "практик", "тест"]):
-        assigns = [m for m in order_modules(course_modules) if m["kind"] in ("assignment", "quiz") and not any(sw in normalize_text(m["title"]) for sw in stop_words)]
+    if any(w in query_lower for w in ["задани", "лаб", "практическ", "практик", "тест"]):
+        assigns = [m for m in order_modules(course_modules) if m["kind"] in ("assignment", "quiz") and not any(
+            sw in normalize_text(m["title"]) for sw in stop_words)]
         if not assigns:
             assigns = [m for m in order_modules(course_modules) if m["kind"] in ("assignment", "quiz")]
-        start = assigns[0] if assigns else choose_default_start(course_modules, skip_org=True)
+        if assigns:
+            start = assigns[0]
+        else:
+            return {"facts": {"mode": "no_assignments",
+                              "указание_ии": "На данный момент нет доступных практических заданий или лабораторных работ. Возможно, они откроются позже или доступны только при выполнении определённых условий."},
+                    "targets": []}
 
     elif any(w in query_lower for w in ["теори", "лекци", "учебник", "читать", "материал"]):
         learning = [m for m in order_modules(course_modules) if m["kind"] == "learning"]
@@ -635,7 +616,7 @@ def exec_course_overview(ontology: Dict[str, Any], course_modules: List[Dict[str
     return {"facts": {
         "course_title": ontology.get("course_title", ""),
         "counts": ontology.get("counts", {}),
-        "start_module": start_mod, # Отдаем безопасную копию без URL
+        "start_module": start_mod,
         "learning_modules": learning_titles,
         "assignment_modules": assignment_titles,
         "quiz_modules": quiz_titles,
@@ -648,7 +629,7 @@ def exec_deadlines(deadlines: List[DeadlineItem], scope: str) -> Dict[str, Any]:
             "has_deadlines": False,
             "deadlines": [],
             "scope": scope,
-            "указание_ии": "На этом курсе не установлены конкретные сроки сдачи заданий в системе. Рекомендуй обратиться к преподавателю за информацией о сроках."
+            "указание_ии": "На этом курсе не установлены конкретные сроки сдачи заданий в системе, либо все задания уже сданы. Рекомендуй студенту обратиться к преподавателю за информацией о сроках."
         }, "targets": []}
     return {"facts": {"has_deadlines": True, "deadlines": deadlines[:10], "scope": scope}, "targets": []}
 
@@ -658,11 +639,33 @@ def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, quer
     candidates, score_map = retrieve_candidates(db=db, course_id=course_id, viewer_role=viewer_role, search_query=query)
 
     if intent == "grading":
-        grading_keywords = ["оценк", "система оценки", "оценивани", "рейтинг", "баллы", "критерии"]
+        grading_title_keywords = ["оценк", "оценивани", "система оценки", "аттестац", "зачет", "экзамен"]
+
+        grading_modules = db.query(ModuleIndex).filter(
+            ModuleIndex.course_id == course_id
+        ).all()
+
+        existing_ids = {c["id"] for c in candidates}
+        grading_extra = []
+        for m in grading_modules:
+            if str(m.id) in existing_ids: continue
+            if not db_module_visible_for_role(m, viewer_role): continue
+            title_norm = normalize_text(m.title or "")
+            content_norm = normalize_text(m.content_text or "")
+            if any(kw in title_norm for kw in grading_title_keywords) or \
+                    any(kw in content_norm for kw in ["зачтено", "неудовлетвор", "отлично", "хорошо", "удовлетвор",
+                                                      "итоговая оценка", "балл", "промежуточн"]):
+                grading_extra.append({
+                    "id": str(m.id), "moodle_id": m.moodle_id, "url": m.url,
+                    "title": m.title, "kind": module_kind(m.title or "", m.module_type),
+                    "content_text": m.content_text, "module_type": m.module_type,
+                })
+                if len(grading_extra) >= 3: break
+
         grading_candidates = [c for c in candidates if
-                              any(kw in normalize_text(c.get("title", "")) for kw in grading_keywords)]
+                              any(kw in normalize_text(c.get("title", "")) for kw in grading_title_keywords)]
         other_candidates = [c for c in candidates if c not in grading_candidates]
-        candidates = grading_candidates + other_candidates
+        candidates = grading_extra + grading_candidates + other_candidates
 
     for c in candidates:
         snippet_raw = c.get("content_text", "")[:80].strip()
@@ -674,14 +677,65 @@ def exec_answer_from_context(db: Session, course_id: str, viewer_role: str, quer
         c_copy.pop("url", None)
         facts_candidates.append(c_copy)
 
-    # ИЗМЕНЕНИЕ: Теперь мы передаем в targets все топ-5 материалов (с их URL), а не только первый [:1]
     return {"facts": {"query": query, "candidates": facts_candidates}, "targets": candidates[:5],
             "score_map": score_map}
 
+SYSTEM_PROMPT = """Ты помощник по учебному курсу в Moodle. Отвечай на основе предоставленных материалов курса.
 
-# =========================
-# GENERATOR
-# =========================
+Правила:
+- Отвечай уверенно и кратко, 2-4 предложения.
+- Запрещены слова: "К сожалению", "Извините", "Прошу прощения".
+- Если в материалах ЕСТЬ информация по теме вопроса — ответь на её основе, даже если точная формулировка отличается от вопроса.
+- НЕ ПРИДУМЫВАЙ дедлайны, оценки, правила сдачи, даты, количество попыток — это критически важно.
+- Если источник содержит ТОЛЬКО метаданные (условия завершения, раздел курса) БЕЗ описания — НЕ ВЫДУМЫВАЙ процедуру. Скажи что есть и дай ссылку.
+- "Экзамен", "зачет", "аттестация" на курсе — это обычно прохождение итогового тестирования. Если студент спрашивает про экзамен, ищи информацию про итоговое тестирование и систему оценки.
+- Если информации действительно нет НИ В ОДНОМ источнике — скажи "В материалах курса нет информации по этому вопросу. Рекомендую обратиться к преподавателю."
+
+Формат ответа — строго JSON:
+{"reply": "твой ответ студенту", "show_link": true, "source_id": "id источника"}
+
+ВАЖНО: В поле "reply" НИКОГДА не включай технические ID источников (src_1, src_2 и т.д.). ID указывай ТОЛЬКО в поле "source_id".
+
+Когда show_link = true:
+- Запрос определения ("Что такое...", "Кто такой...")
+- Студент просит ссылку или переход к материалу
+- Ответ основан на конкретном источнике
+В остальных случаях show_link = false, source_id = null."""
+
+
+def format_context_for_llm(facts: dict) -> Tuple[str, Dict[str, str]]:
+    parts = []
+    id_map = {}
+
+    candidates = facts.get("candidates", [])
+    if candidates:
+        parts.append("НАЙДЕННЫЕ МАТЕРИАЛЫ КУРСА:")
+        for i, c in enumerate(candidates, 1):
+            title = c.get("title", "Без названия")
+            text = c.get("content_text", "").strip()
+            cid = c.get("id", "")
+            simple_id = f"src_{i}"
+            id_map[simple_id] = cid
+            if text:
+                parts.append(f"\n[Источник {i}] (id: {simple_id}) {title}\n{text}")
+
+    skip_keys = {"query", "candidates"}
+    extra_facts = {k: v for k, v in facts.items() if k not in skip_keys and v}
+    if extra_facts:
+        parts.append("\nДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ:")
+        parts.append(json.dumps(extra_facts, ensure_ascii=False, default=str))
+
+    return ("\n".join(parts) if parts else "Релевантных материалов не найдено."), id_map
+
+
+def clean_reply_text(reply: str) -> str:
+    reply = re.sub(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', '', reply)
+    reply = re.sub(r'\bsrc_\d+\b', '', reply)
+    reply = re.sub(r'в источнике\s*[,.]?\s*', '', reply, flags=re.IGNORECASE)
+    reply = re.sub(r'источник\s*[,.]?\s*', '', reply, flags=re.IGNORECASE)
+    reply = re.sub(r'\s+', ' ', reply).strip()
+    return reply
+
 
 def generate_response(
         user_msg: str,
@@ -693,58 +747,34 @@ def generate_response(
     facts = execution.get("facts", {})
     all_targets = [t for t in execution.get("targets", []) if t]
 
-    prompt = f"""
-Ты интеллектуальный помощник для студентов курса в Moodle.
-Твой стиль общения: уверенный, прямой, профессиональный. Отвечай вежливо, но без извинений и лишних вводных слов. Максимум 3-4 предложения.
-ОТВЕЧАЙ СТРОГО НА ОСНОВЕ ПЕРЕДАННЫХ ФАКТОВ. Ничего не придумывай.
+    context_text, id_map = format_context_for_llm(facts)
 
-ПРАВИЛА БЕЗОПАСНОСТИ:
-1. Запрещено придумывать правила сдачи, дедлайны.
-2. Запрещено соглашаться с догадками студента.
-3. Если информации нет: "В материалах курса нет точной информации..."
-4. Запрещены: "К сожалению", "Извините", "Прошу прощения", "Исходя из контекста".
+    user_prompt = f"""Курс: {ontology.get("course_title", "Без названия")}
+Вопрос студента: {user_msg}
 
-ПРАВИЛА УПРАВЛЕНИЯ ИНТЕРФЕЙСОМ (show_link):
-Ты управляешь появлением кнопки-ссылки.
-"show_link": false - по умолчанию.
-"show_link": true - ОБЯЗАТЕЛЬНО используй, если:
-  - Студент просит ссылку ("где это?").
-  - Студент просит перейти к материалу.
-  - Студент спрашивает определение термина ("Что такое...", "Кто такой..."). В этом случае всегда давай источник!
+{context_text}"""
 
-Верни СТРОГО валидный JSON:
-{{
-  "_thought": "Рассуждай: это запрос термина? Если да, я обязан дать ссылку. Укажи ID.",
-  "exact_quote": "Точная цитата из текста",
-  "reply": "Твой ответ",
-  "show_link": true,
-  "source_id": "ID материала"
-}}
-
---- КОНТЕКСТ ---
-Запрос: {user_msg}
-Курс: {ontology.get("course_title", "Без названия")}
-
-Найденные факты из базы для ответа:
-{json.dumps(facts, ensure_ascii=False, default=str)}
-"""
     try:
         resp = client.chat.completions.create(
             model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.35,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
             response_format={"type": "json_object"},
-            extra_body={"options": {"num_ctx": 8192}}
+            extra_body={"options": {"num_ctx": 12288}}
         )
 
         raw_content = resp.choices[0].message.content.strip()
         data = extract_json_from_text(raw_content)
-        reply = safe_strip(data.get("reply", ""))
+        reply = clean_reply_text(safe_strip(data.get("reply", "")))
 
         show_link_val = data.get("show_link", False)
         show_link = str(show_link_val).lower() == "true" if isinstance(show_link_val, str) else bool(show_link_val)
 
-        source_id = data.get("source_id")
+        source_id_raw = data.get("source_id") or ""
+        source_id = id_map.get(source_id_raw, source_id_raw)
         exact_quote = data.get("exact_quote")
 
         final_targets = []
@@ -773,11 +803,13 @@ def generate_response(
             raw = resp.choices[0].message.content.strip()
             recovered = extract_json_from_text(raw)
             if recovered and recovered.get("reply"):
+                reply = clean_reply_text(recovered["reply"])
                 show_link_val = recovered.get("show_link", False)
                 show_link = str(show_link_val).lower() == "true" if isinstance(show_link_val, str) else bool(
                     show_link_val)
 
-                source_id = recovered.get("source_id")
+                source_id_raw = recovered.get("source_id") or ""
+                source_id = id_map.get(source_id_raw, source_id_raw)
                 exact_quote = recovered.get("exact_quote")
 
                 final_targets = []
@@ -793,17 +825,13 @@ def generate_response(
                     if exact_quote and final_targets:
                         final_targets[0]["snippet"] = exact_quote
 
-                return {"reply": recovered["reply"], "targets": final_targets if show_link else []}
+                return {"reply": reply, "targets": final_targets if show_link else []}
             if not raw.startswith("{"):
-                return {"reply": raw, "targets": all_targets[:1]}
+                return {"reply": clean_reply_text(raw), "targets": all_targets[:1]}
 
     return {
         "reply": "Произошла техническая ошибка при формулировании ответа. Пожалуйста, попробуйте спросить чуть иначе.",
         "targets": all_targets[:1]}
-
-# =========================
-# ENDPOINTS
-# =========================
 
 @app.post("/api/course/sync")
 def sync_course(data: CourseData, db: Session = Depends(get_db)):
@@ -911,12 +939,34 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
     user_msg = safe_strip(data.message)
     viewer_role = data.viewer_role or "student"
     course_modules = build_course_modules(db_course, viewer_role)
-    ontology = build_course_ontology(course_modules, data.deadlines, data.course_title or db_course.title)
+
+    deadlines = data.deadlines
+    if deadlines:
+        try:
+            db.query(CourseDeadline).filter(CourseDeadline.course_id == data.course_id).delete()
+            for d in deadlines:
+                db.add(CourseDeadline(
+                    course_id=data.course_id,
+                    moodle_id="",
+                    title=d.title,
+                    due_date=d.due_date,
+                    url=d.url
+                ))
+            db.commit()
+        except Exception:
+            pass
+    else:
+        db_deadlines = db.query(CourseDeadline).filter(
+            CourseDeadline.course_id == data.course_id
+        ).all()
+        if db_deadlines:
+            deadlines = [DeadlineItem(title=d.title, due_date=d.due_date, url=d.url) for d in db_deadlines]
+
+    ontology = build_course_ontology(course_modules, deadlines, data.course_title or db_course.title)
 
     enriched_msg = enrich_query_with_history(user_msg, data.history)
-    route = route_request(enriched_msg, ontology, bool(data.deadlines))
+    route = route_request(enriched_msg, ontology, bool(deadlines))
 
-    # Распознавание запроса на источник (чтобы жестко направить в правильный кусок базы)
     msg_normalized = normalize_text(user_msg)
     words = msg_normalized.split()
     source_request_markers = ["откуда", "где ты", "где нашел", "каком материал", "какой лекции", "где это",
@@ -956,7 +1006,7 @@ def smart_search(data: SmartSearchRequest, db: Session = Depends(get_db)):
                 "преподаватели"] = fallback_teachers if fallback_teachers else "В системе нет информации о преподавателях этого курса."
 
     elif route["action"] == "find_deadline":
-        execution = exec_deadlines(data.deadlines, "generic")
+        execution = exec_deadlines(deadlines, "generic")
     elif route["action"] == "course_overview":
         execution = exec_course_overview(ontology, course_modules)
     elif route["action"] == "navigate":

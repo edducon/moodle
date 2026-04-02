@@ -44,7 +44,7 @@ class ChatLog(Base):
     viewer_role = Column(String(50))
     user_query = Column(Text)
     ai_reply = Column(Text)
-    used_context = Column(Text) # Сохраняем, на какие куски текста ИИ опирался
+    used_context = Column(Text)
     is_helpful = Column(Boolean, nullable=True)
 
 class CourseParticipant(Base):
@@ -55,6 +55,17 @@ class CourseParticipant(Base):
     name = Column(String)
     role = Column(String)
     group_name = Column(String, nullable=True)
+
+class CourseDeadline(Base):
+    __tablename__ = "course_deadlines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    course_id = Column(String, index=True)
+    moodle_id = Column(String, index=True)
+    title = Column(String)
+    due_date = Column(String)
+    url = Column(String)
+    last_updated = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 with engine.connect() as conn:
     conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
@@ -83,5 +94,20 @@ with engine.connect() as conn:
     conn.execute(text("""
         CREATE INDEX IF NOT EXISTS ix_course_participants_course_id
         ON course_participants (course_id)
+    """))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS course_deadlines (
+            id SERIAL PRIMARY KEY,
+            course_id VARCHAR,
+            moodle_id VARCHAR,
+            title VARCHAR,
+            due_date VARCHAR,
+            url VARCHAR,
+            last_updated TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_course_deadlines_course_id
+        ON course_deadlines (course_id)
     """))
     conn.commit()

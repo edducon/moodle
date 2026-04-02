@@ -1,6 +1,6 @@
 #moodle-deadlines-widget {
     position: fixed;
-    bottom: 170px; /* Прямо под шапкой сайта */
+    bottom: 170px;
     right: 20px;
     width: 320px;
     background: var(--mb-panel);
@@ -13,7 +13,6 @@
     transition: width 0.3s ease, border-radius 0.3s ease;
 }
 
-/* Свернутый режим (кнопка-таблетка) */
 #moodle-deadlines-widget.is-collapsed {
     width: auto;
     border-radius: 30px;
@@ -39,7 +38,7 @@
 .md-title { font-weight: bold; font-size: 14px; white-space: nowrap; }
 
 .md-badge {
-    background: #dc3545; /* Красный цвет для важности */
+    background: #dc3545;
     color: #fff;
     font-size: 12px;
     font-weight: bold;
@@ -63,7 +62,7 @@
 
 #moodle-deadlines-widget.is-collapsed .md-toggle-btn,
 #moodle-deadlines-widget.is-collapsed .md-title {
-    display: none; /* Прячем текст и стрелку, оставляем только иконку и счетчик */
+    display: none;
 }
 
 #moodle-deadlines-body {

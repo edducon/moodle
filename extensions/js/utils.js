@@ -6,14 +6,12 @@ async function getCourseDOMs() {
 
     const doms = [document];
 
-    // НОВОЕ: Ищем ссылки на скрытые секции во ВСЕХ форматах (недели, темы, сетка)
     const linkNodes = document.querySelectorAll(
-        'h3.sectionname a[href*="section="], ' +          /* Обычный формат с пагинацией */
-        '.thegrid a.grid-section-inner[href*="section="], ' + /* Формат "Сетка" (Grid) */
-        '.course-content .section-summary a[href*="section="]' /* Свернутые темы */
+        'h3.sectionname a[href*="section="], ' +
+        '.thegrid a.grid-section-inner[href*="section="], ' +
+        '.course-content .section-summary a[href*="section="]'
     );
 
-    // Собираем уникальные ссылки, чтобы не качать одну страницу дважды
     let links = new Set();
     linkNodes.forEach(a => links.add(a.href));
     const sectionLinks = Array.from(links);
@@ -31,7 +29,7 @@ async function getCourseDOMs() {
             });
             const results = await Promise.all(promises);
             doms.push(...results.filter(Boolean));
-            await new Promise(r => setTimeout(r, 200)); // небольшая пауза, чтобы не дудосить сервер
+            await new Promise(r => setTimeout(r, 200));
         }
     }
 
@@ -75,14 +73,13 @@ function isActivityHidden(actElement) {
     return false;
 }
 
-// === УЛУЧШЕННЫЙ ПАРСЕР ИНФОРМАЦИИ ОБ ЭЛЕМЕНТЕ ===
 function extractVisibilityInfo(actElement) {
     if (!actElement) return { is_hidden: false, has_restrictions: false, raw_text: "" };
 
     let meta = {
         is_hidden: isActivityHidden(actElement),
         has_restrictions: hasRestrictionMarkers(actElement) && !isActivityHidden(actElement),
-        section_title: "", // НОВОЕ: Название темы/раздела
+        section_title: "",
         restrictions: [],
         dates: [],
         completion_rules: [],
@@ -92,7 +89,6 @@ function extractVisibilityInfo(actElement) {
     };
 
     try {
-        // 0. Находим, в какой теме (разделе) находится элемент
         const sectionNode = actElement.closest('li.section.main');
         if (sectionNode) {
             const secTitleNode = sectionNode.querySelector('h3.sectionname');
@@ -101,16 +97,13 @@ function extractVisibilityInfo(actElement) {
             }
         }
 
-        // 1. Даты (ИСПРАВЛЕНО ДУБЛИРОВАНИЕ)
         const datesWrapper = actElement.querySelector('.activity-dates .description-inner');
         if (datesWrapper) {
-            // Берем только прямых детей, чтобы не хватать текст родителя
             Array.from(datesWrapper.children).forEach(child => {
                 const txt = cleanText(child.innerText);
                 if (txt) meta.dates.push(txt);
             });
         } else {
-            // Фолбэк на случай другой верстки Moodle
             const altDates = actElement.querySelector('.activity-dates');
             if (altDates) {
                 const txt = cleanText(altDates.innerText);
@@ -118,7 +111,6 @@ function extractVisibilityInfo(actElement) {
             }
         }
 
-        // 2. Условия доступа и ограничения
         const restrictTree = actElement.querySelectorAll('.availabilityinfo li:not(.showmore)');
         if (restrictTree.length > 0) {
             restrictTree.forEach(li => {
@@ -134,25 +126,21 @@ function extractVisibilityInfo(actElement) {
             }
         }
 
-        // 3. Условия завершения (что нужно сделать студенту)
         const completionEls = actElement.querySelectorAll('.automatic-completion-conditions span.font-weight-normal, [data-region="completion-info"] button');
         completionEls.forEach(el => {
             const txt = cleanText(el.innerText);
             if (txt) meta.completion_rules.push(txt);
         });
 
-        // 4. Детали ресурса (Вес, расширение, дата загрузки файла)
         const resDetails = actElement.querySelector('.resourcelinkdetails');
         if (resDetails) {
             meta.resource_details = cleanText(resDetails.innerText);
         }
 
-        // 5. Текст пояснений и меток (inline-описания)
         const descEls = actElement.querySelectorAll('.activity-altcontent .description-inner, .description .description-inner > .no-overflow');
         let descParts = [];
         descEls.forEach(el => {
             const txt = cleanText(el.innerText);
-            // Фильтруем то, что уже собрали в других блоках
             if (txt && !txt.includes('Недоступно') && !txt.includes('Открыто с')) {
                 descParts.push(txt);
             }
@@ -200,11 +188,9 @@ function parseRuDate(dateStr) {
 
 function getCourseMap() {
     let map = [];
-    // Берем все скачанные страницы курса (главную + все скрытые темы)
     const doms = window.MoodleBot.courseDOMsCache || [document];
 
     doms.forEach(doc => {
-        // Исключаем .section-summary, чтобы не дублировать блоки
         doc.querySelectorAll('li.section.main:not(.section-summary)').forEach(sec => {
             let secTitleEl = sec.querySelector('h3.sectionname');
             if (!secTitleEl) return;
@@ -249,8 +235,6 @@ function getCourseMap() {
     return map.join('\n\n').substring(0, 3000);
 }
 
-// Парсинг страницы участников — ищем только преподавателей
-// Возвращает массив объектов {name, role, group_name} или пустой массив
 async function parseTeachersFromParticipants() {
     const courseId = getCourseId();
     if (!courseId) return [];
@@ -269,27 +253,21 @@ async function parseTeachersFromParticipants() {
 
         let teachers = [];
         doc.querySelectorAll('table#participants tbody tr:not(.emptyrow)').forEach(row => {
-            // Сканируем весь текст строки (без привязки к конкретным ячейкам и спанам)
             const rowText = (row.textContent || '').toLowerCase();
 
-            // Если в строке есть нужные нам слова — это препод/ассистент
             if (/преподаватель|ассистент|тьютор/i.test(rowText)) {
-                // Имя всегда лежит в th.c1 или td.c1
                 const nameCell = row.querySelector('th.c1, td.c1');
 
                 if (nameCell) {
                     const nameClone = nameCell.cloneNode(true);
-                    // Вычищаем аватарки и иконки
                     nameClone.querySelectorAll('img, .quickediticon, .accesshide, i, a.quickeditlink').forEach(el => el.remove());
                     let name = (nameClone.textContent || '').replace(/\s+/g, ' ').trim();
 
-                    // Если вдруг Moodle завернул имя хитрее, берем напрямую из ссылки
                     if (!name) {
                         const nameLink = nameCell.querySelector('a');
                         if (nameLink) name = (nameLink.textContent || '').trim();
                     }
 
-                    // Определяем роль для красивого вывода
                     let roleText = 'Преподаватель';
                     if (rowText.includes('ассистент')) roleText = 'Ассистент';
                     if (rowText.includes('тьютор')) roleText = 'Тьютор';
@@ -399,7 +377,6 @@ function extractMeaningfulContent(doc) {
         '#nav-drawer', '[data-region="drawer"]', '[data-region="message-drawer"]', '.popover-region',
         '#page-footer', 'footer', 'nav', '.navbar', '.block', '.activity-navigation',
         '.sr-only', '.hidden', 'script', 'style',
-        // --- Убираем интерфейс оценивания (виден только преподавателю) ---
         '.gradingsummary', '.submissionsummarytable', '[data-region="grading-summary"]',
         'select', '.groupselector'
     ];
@@ -408,7 +385,6 @@ function extractMeaningfulContent(doc) {
         clone.querySelectorAll(selector).forEach(el => el.remove());
     });
 
-    // --- Убираем таблицы со статистикой ответов преподавателя ---
     clone.querySelectorAll('table').forEach(table => {
         const text = table.innerText || '';
         if (text.includes('Требуют оценки') || text.includes('Просмотр всех ответов')) {
@@ -420,11 +396,8 @@ function extractMeaningfulContent(doc) {
 }
 
 function shouldIndexModuleType(type) {
-    // Если тип пустой, игнорируем
     if (!type) return false;
 
-    // Если нужно игнорировать какие-то конкретные системные модули,
-    // можно добавить их сюда. Но по умолчанию теперь разрешаем ВСЕ типы.
     const ignoredTypes = ['scorm', 'feedback'];
 
     return !ignoredTypes.includes(type);

@@ -18,7 +18,6 @@ async function parseCourseIndex() {
                     const a = act.querySelector('a.aalink');
                     const moduleType = getModuleType(act);
 
-                    // Собираем даже те элементы, у которых нет ссылок (например, метки/label)
                     const urlToSave = a ? a.href : window.location.origin + window.location.pathname + '#' + act.id;
 
                     sectionData.modules.push({
@@ -38,7 +37,6 @@ async function parseCourseIndex() {
     });
 
     try {
-        // Парсим преподавателей со страницы участников (параллельно)
         const teachersPromise = parseTeachersFromParticipants();
         const teachers = await teachersPromise;
 
@@ -50,7 +48,7 @@ async function parseCourseIndex() {
                 title: document.title,
                 sections: Array.from(sectionsMap.values()),
                 viewer_role: getViewerRole(),
-                participants: teachers  // Передаём только преподавателей (или пустой массив)
+                participants: teachers
             })
         });
 
@@ -71,7 +69,6 @@ async function runSilentSpider() {
             const moduleType = getModuleType(act);
             const isLabel = moduleType === 'label';
 
-            // Разрешаем меткам (label) попадать в паук без ссылки
             if ((a || isLabel) && shouldIndexModuleType(moduleType) && !validModulesMap.has(act.id)) {
                 const visibilityData = extractVisibilityInfo(act);
                 validModulesMap.set(act.id, {
@@ -93,7 +90,6 @@ async function runSilentSpider() {
 
         const promises = chunk.map(async (item) => {
             try {
-                // Создаем красивый текстовый блок с метаданными для ИИ
                 let metaContext = [];
                 const vis = item.visibility || {};
 
@@ -106,13 +102,11 @@ async function runSilentSpider() {
 
                 const metaString = metaContext.length > 0 ? ("\nМЕТАДАННЫЕ ЭЛЕМЕНТА:\n" + metaContext.join("\n")) : "";
 
-                // Если это файл
                 if (item.is_file) {
                     const fileSeoText = `Это прикрепленный учебный материал (файл) по теме "${item.title}". Обязательно изучите этот файл.` + metaString;
                     return { ...item, content_text: cleanText(fileSeoText), url: item.href };
                 }
 
-                // Если это текстовая метка на главной странице курса
                 if (item.module_type === 'label') {
                     const labelText = `Это текстовая вставка (пояснение) на странице курса.` + metaString;
                     return { ...item, content_text: cleanText(labelText), url: item.href };
@@ -141,7 +135,6 @@ async function runSilentSpider() {
                         : `Это практический материал по теме "${item.title}".`);
                 }
 
-                // Прикрепляем к спарсенному тексту всю извлеченную мету
                 text = text + "\n\n" + metaString;
 
                 return { ...item, content_text: text.trim(), url: item.href };
@@ -173,7 +166,6 @@ async function passiveModuleSync() {
             let text = extractMeaningfulContent(document);
             const visInfo = act ? extractVisibilityInfo(act) : null;
 
-            // Если зашли на страницу, подгружаем мету с главной страницы курса, если есть
             if (visInfo) {
                 let metaContext = [];
                 if (visInfo.section_title) metaContext.push("Тема/Раздел курса: " + visInfo.section_title);
